@@ -28,6 +28,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Coroutine
 
+# 尝试导入 yaml，如果没有则给出友好提示
+try:
+    import yaml
+except ImportError:
+    print("[错误] 需要安装 PyYAML: pip install pyyaml")
+    sys.exit(1)
+
 # ============================================================
 # 1. 工具注册表
 # ============================================================
@@ -64,7 +71,134 @@ class ToolRegistry:
 
 
 # ============================================================
-# 2. Session — 双目录隔离
+# 2. 模型注册表 — 多模型配置
+# ============================================================
+
+@dataclass
+class ModelConfig:
+    """单个模型的配置。"""
+    name: str                # 模型别名，如 "deepseek"、"kimi"
+    base_url: str            # API 端点，如 "https://api.deepseek.com/v1"
+    api_key: str             # API 密钥
+    model: str               # 实际模型名，如 "deepseek-chat"
+    token_cap: int = 32000   # 上下文窗口上限
+    provider: str = "openai" # 预留：未来支持非 OpenAI 接口
+
+
+class ModelRegistry:
+    """
+    模型注册表：管理多个 LLM 配置。
+
+    支持从以下位置加载（按优先级）：
+    1. DAG 工作区内的 models.yaml
+    2. ~/.agenda/models.yaml（全局配置）
+    3. 环境变量（fallback）
+
+    示例 models.yaml：
+        models:
+          deepseek:
+            base_url: "https://api.deepseek.com/v1"
+            api_key: "${DEEPSEEK_API_KEY}"   # 支持 ${ENV_VAR} 引用
+            model: "deepseek-chat"
+            token_cap: 64000
+
+          kimi:
+            base_url: "https://api.moonshot.cn/v1"
+            api_key: "${KIMI_API_KEY}"
+            model: "moonshot-v1-8k"
+            token_cap: 8000
+
+          claude:
+            base_url: "https://api.anthropic.com/v1"
+            api_key: "${ANTHROPIC_API_KEY}"
+            model: "claude-3-5-sonnet"
+            token_cap: 200000
+    """
+
+    _GLOBAL_PATH = Path.home() / ".agenda" / "models.yaml"
+
+    def __init__(self) -> None:
+        self._models: dict[str, ModelConfig] = {}
+
+    def load(self, dag_dir: Path | None = None) -> ModelRegistry:
+        """加载模型配置。"""
+        # 1. 先尝试 DAG 工作区内的 models.yaml
+        if dag_dir:
+            local_file = dag_dir / "models.yaml"
+            if local_file.exists():
+                self._load_file(local_file)
+                return self
+
+        # 2. 再尝试全局配置
+        if self._GLOBAL_PATH.exists():
+            self._load_file(self._GLOBAL_PATH)
+            return self
+
+        # 3. fallback：从环境变量创建默认模型
+        self._models["default"] = ModelConfig(
+            name="default",
+            base_url=os.environ.get("AGENDA_BASE_URL", "https://api.openai.com/v1"),
+            api_key=os.environ.get("AGENDA_API_KEY", ""),
+            model=os.environ.get("AGENDA_MODEL", "gpt-4"),
+            token_cap=int(os.environ.get("AGENDA_TOKEN_CAP", "32000")),
+        )
+        return self
+
+    def _load_file(self, path: Path) -> None:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        for name, cfg in (raw.get("models") or {}).items():
+            if not isinstance(cfg, dict):
+                continue
+            self._models[name] = ModelConfig(
+                name=name,
+                base_url=self._resolve_value(cfg.get("base_url", "")),
+                api_key=self._resolve_value(cfg.get("api_key", "")),
+                model=self._resolve_value(cfg.get("model", "")),
+                token_cap=int(cfg.get("token_cap", 32000)),
+                provider=cfg.get("provider", "openai"),
+            )
+
+    def _resolve_value(self, value: str) -> str:
+        """解析 ${ENV_VAR} 格式的值。"""
+        if not isinstance(value, str):
+            return str(value)
+        match = re.match(r'^\$\{([^}]+)\}$', value.strip())
+        if match:
+            env_name = match.group(1)
+            env_val = os.environ.get(env_name, "")
+            if not env_val:
+                print(f"[警告] 环境变量未设置: {env_name}")
+            return env_val
+        return value
+
+    def get(self, name: str | None) -> ModelConfig:
+        """获取模型配置。如果 name 为 None 或不存在，返回 default。"""
+        if not name:
+            return self._models.get("default", self._default_fallback())
+        if name not in self._models:
+            # 尝试匹配 model 字段（兼容直接写 model id）
+            for cfg in self._models.values():
+                if cfg.model == name:
+                    return cfg
+            print(f"[警告] 未知模型别名 '{name}'，使用 default")
+            return self._models.get("default", self._default_fallback())
+        return self._models[name]
+
+    def _default_fallback(self) -> ModelConfig:
+        return ModelConfig(
+            name="default",
+            base_url=os.environ.get("AGENDA_BASE_URL", "https://api.openai.com/v1"),
+            api_key=os.environ.get("AGENDA_API_KEY", ""),
+            model=os.environ.get("AGENDA_MODEL", "gpt-4"),
+            token_cap=32000,
+        )
+
+    def list_models(self) -> list[str]:
+        return list(self._models.keys())
+
+
+# ============================================================
+# 3. Session — 双目录隔离
 # ============================================================
 
 class Session:
@@ -174,7 +308,7 @@ class Session:
 
 
 # ============================================================
-# 3. Hook 注册表
+# 4. Hook 注册表
 # ============================================================
 
 HookFunc = Callable[["AgentLoop"], Coroutine[Any, Any, None]]
@@ -225,7 +359,7 @@ class HookRegistry:
 
 
 # ============================================================
-# 4. Agent Loop — 核心循环
+# 5. Agent Loop — 核心循环
 # ============================================================
 
 class AgentLoop:
@@ -237,19 +371,20 @@ class AgentLoop:
     def __init__(
         self,
         session: Session,
-        llm_client: Any,  # 任何有 chat.completions.create 的对象
+        model_registry: ModelRegistry,
         tools: ToolRegistry,
         hooks: HookRegistry | None = None,
-        model: str = "deepseek-chat",
-        token_cap: int = 32000,
+        model: str | None = None,   # 模型别名，如 "deepseek"、"kimi"
     ) -> None:
         self.session = session
-        self.client = llm_client
+        self.model_registry = model_registry
+        self.model_cfg = model_registry.get(model)
         self.tools = tools
         self.hooks = hooks or HookRegistry()
-        self.model = model
-        self.token_cap = token_cap
+        self.token_cap = self.model_cfg.token_cap
         self.messages: list[dict] = []
+        # 延迟创建 client（支持不同模型用不同 endpoint）
+        self._client: Any | None = None
 
     async def run(self, system_prompt: str, task: str) -> str:
         """运行 Agent，返回最终产物。"""
@@ -295,10 +430,29 @@ class AgentLoop:
 
     # --- 内部方法 ---
 
+    def _ensure_client(self) -> Any:
+        """根据模型配置创建 OpenAI 兼容客户端。"""
+        if self._client is not None:
+            return self._client
+
+        cfg = self.model_cfg
+        try:
+            from openai import AsyncOpenAI
+        except ImportError:
+            print("[错误] 需要安装 openai: pip install openai")
+            raise SystemExit(1)
+
+        self._client = AsyncOpenAI(
+            base_url=cfg.base_url,
+            api_key=cfg.api_key,
+        )
+        return self._client
+
     async def _call_llm(self) -> dict:
         """调用 LLM API。兼容任何 OpenAI 格式的客户端。"""
+        client = self._ensure_client()
         kwargs = {
-            "model": self.model,
+            "model": self.model_cfg.model,
             "messages": self.messages,
             "temperature": 0.6,
         }
@@ -306,15 +460,8 @@ class AgentLoop:
             kwargs["tools"] = self.tools.schemas()
             kwargs["tool_choice"] = "auto"
 
-        # 支持 asyncio client（openai.AsyncOpenAI）或同步 client
-        if asyncio.iscoroutinefunction(getattr(self.client.chat.completions, "create", None)):
-            resp = await self.client.chat.completions.create(**kwargs)
-            return resp.model_dump()
-        else:
-            # 同步 client，在线程池中运行
-            loop = asyncio.get_event_loop()
-            resp = await loop.run_in_executor(None, lambda: self.client.chat.completions.create(**kwargs))
-            return resp.model_dump()
+        resp = await client.chat.completions.create(**kwargs)
+        return resp.model_dump()
 
     async def _execute_tool(self, tc: dict) -> str:
         """执行单个 tool call。"""
@@ -399,7 +546,7 @@ class AgentLoop:
 
 
 # ============================================================
-# 5. DAG 调度器
+# 6. DAG 调度器
 # ============================================================
 
 class DAGScheduler:
@@ -424,6 +571,10 @@ class DAGScheduler:
         self.dag: dict = {}
         self.completed: set[str] = set()
         self.running: set[str] = set()
+
+        # 加载模型注册表
+        self.model_registry = ModelRegistry().load(self.dag_dir)
+        print(f"[模型] 可用模型: {', '.join(self.model_registry.list_models())}")
 
     def load(self) -> DAGScheduler:
         """从 dag.yaml 加载，或创建默认空 DAG。"""
@@ -493,7 +644,6 @@ class DAGScheduler:
 
     async def run(
         self,
-        llm_client: Any,
         tools_factory: Callable[[Session], ToolRegistry],
         hooks_factory: Callable[[], HookRegistry] | None = None,
     ) -> dict[str, str]:
@@ -530,17 +680,17 @@ class DAGScheduler:
     async def _run_node(
         self,
         node_id: str,
-        llm_client: Any,
         tools_factory: Callable[[Session], ToolRegistry],
         hooks_factory: Callable[[], HookRegistry] | None,
     ) -> None:
         """运行单个节点。"""
         self.running.add(node_id)
-        print(f"[节点] {node_id} 启动")
+        config = self.dag["nodes"][node_id]
+        model_alias = config.get("model")
+        print(f"[节点] {node_id} 启动 (模型: {model_alias or 'default'})")
 
         try:
             session = self.prepare_node(node_id)
-            config = self.dag["nodes"][node_id]
 
             tools = tools_factory(session)
             hooks = hooks_factory() if hooks_factory else HookRegistry()
@@ -563,10 +713,10 @@ class DAGScheduler:
 
             agent = AgentLoop(
                 session=session,
-                llm_client=llm_client,
+                model_registry=self.model_registry,
                 tools=tools,
                 hooks=hooks,
-                model=os.environ.get("AGENDA_MODEL", "deepseek-chat"),
+                model=model_alias,
             )
 
             result = await agent.run(system_prompt, config["prompt"])
@@ -617,7 +767,7 @@ class DAGScheduler:
 
 
 # ============================================================
-# 6. 安全审查（从 EVA 移植）
+# 7. 安全审查（从 EVA 移植）
 # ============================================================
 
 class SecurityReviewer:
@@ -660,7 +810,7 @@ class SecurityReviewer:
 
 
 # ============================================================
-# 7. 工具工厂（内置工具）
+# 8. 工具工厂（内置工具）
 # ============================================================
 
 def build_tools(session: Session, allow_shell: bool = False, llm_client: Any | None = None) -> ToolRegistry:
@@ -734,7 +884,7 @@ def build_tools(session: Session, allow_shell: bool = False, llm_client: Any | N
 
 
 # ============================================================
-# 8. 命令行入口
+# 9. 命令行入口
 # ============================================================
 
 def cli() -> int:
@@ -790,7 +940,7 @@ def cli() -> int:
 
 
 # ============================================================
-# 9. 示例用法
+# 10. 示例用法
 # ============================================================
 
 """
