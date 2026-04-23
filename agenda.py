@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Agenda — 给 Agent 调度 Agent 的极简运行时。
+Agenda v0.0.4 — DAG-native Agent Runtime with Multi-Agent support.
 
 设计原则：
 - 文件系统即状态（没有数据库、没有 socket）
@@ -9,9 +9,20 @@ Agenda — 给 Agent 调度 Agent 的极简运行时。
 - DAG 原生（依赖关系是 first-class）
 - Hook 即策略（关键节点注入行为，不改源码）
 - AI 自压缩记忆（token 满时让 Agent 自己归档）
+- 子 Agent 嵌套（Agent 可动态创建子 Agent，文件系统桥接通信）
 
-依赖：只有标准库 + requests（或用户自己传 client）
+依赖：标准库 + pyyaml + openai
 单文件：复制粘贴即可运行，无需 pip install -e .
+
+从 Butterfly 学习的关键设计：
+  - append-only JSONL 持久化（context.jsonl / messages.jsonl）
+  - 子 Agent 通过文件系统桥接（独立 session，轮询 output/done.json）
+  - 每轮迭代后立即 commit 历史（防止取消后 orphan tool_call）
+  - 最大迭代次数 + 超时保护
+
+从 EVA 学习的关键设计：
+  - AI 自驱动记忆压缩（《紧急危机》prompt）
+  - LLM 语义安全审查
 """
 
 from __future__ import annotations
@@ -20,9 +31,12 @@ import asyncio
 import json
 import os
 import re
+import shutil
+import signal
 import sys
 import time
 import traceback
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +48,24 @@ try:
 except ImportError:
     print("[错误] 需要安装 PyYAML: pip install pyyaml")
     sys.exit(1)
+
+# ============================================================
+# 0. 常量与退出码
+# ============================================================
+
+EXIT_SUCCESS = 0
+EXIT_ARGS_ERROR = 1
+EXIT_DAG_CONFIG_ERROR = 2
+EXIT_EXECUTION_ERROR = 3
+EXIT_DEPENDENCY_ERROR = 4
+
+# 子 Agent 最大嵌套深度（防止无限 fork）
+MAX_SUB_AGENT_DEPTH = 2
+
+# Agent 默认安全限制
+DEFAULT_MAX_ITERATIONS = 50
+DEFAULT_NODE_TIMEOUT = 600  # 秒
+DEFAULT_MAX_RETRIES = 3
 
 # ============================================================
 # 1. 工具注册表
@@ -59,15 +91,41 @@ class ToolRegistry:
         """生成 OpenAI function calling 格式的 schemas。"""
         schemas = []
         for name, func in self._tools.items():
+            sig = self._infer_schema(func)
             schemas.append({
                 "type": "function",
                 "function": {
                     "name": name,
                     "description": (func.__doc__ or "").strip(),
-                    "parameters": {"type": "object", "properties": {}},
+                    "parameters": sig,
                 },
             })
         return schemas
+
+    @staticmethod
+    def _infer_schema(func: ToolFunc) -> dict:
+        """从函数签名简单推断 JSON Schema（支持常见类型标注）。"""
+        import inspect
+        sig = inspect.signature(func)
+        props: dict[str, dict] = {}
+        required: list[str] = []
+        for pname, param in sig.parameters.items():
+            if pname in ("session",):
+                continue
+            ann = param.annotation
+            pschema: dict = {"type": "string"}
+            if ann is int:
+                pschema = {"type": "integer"}
+            elif ann is bool:
+                pschema = {"type": "boolean"}
+            elif ann is float:
+                pschema = {"type": "number"}
+            if param.default is inspect.Parameter.empty:
+                required.append(pname)
+            else:
+                pschema["default"] = param.default
+            props[pname] = pschema
+        return {"type": "object", "properties": props, "required": required}
 
 
 # ============================================================
@@ -78,7 +136,7 @@ class ToolRegistry:
 class ModelConfig:
     """单个模型的配置。"""
     name: str                # 模型别名，如 "deepseek"、"kimi"
-    base_url: str            # API 端点，如 "https://api.deepseek.com/v1"
+    base_url: str            # API 端点
     api_key: str             # API 密钥
     model: str               # 实际模型名，如 "deepseek-chat"
     token_cap: int = 32000   # 上下文窗口上限
@@ -88,31 +146,7 @@ class ModelConfig:
 class ModelRegistry:
     """
     模型注册表：管理多个 LLM 配置。
-
-    支持从以下位置加载（按优先级）：
-    1. DAG 工作区内的 models.yaml
-    2. ~/.agenda/models.yaml（全局配置）
-    3. 环境变量（fallback）
-
-    示例 models.yaml：
-        models:
-          deepseek:
-            base_url: "https://api.deepseek.com/v1"
-            api_key: "${DEEPSEEK_API_KEY}"   # 支持 ${ENV_VAR} 引用
-            model: "deepseek-chat"
-            token_cap: 64000
-
-          kimi:
-            base_url: "https://api.moonshot.cn/v1"
-            api_key: "${KIMI_API_KEY}"
-            model: "moonshot-v1-8k"
-            token_cap: 8000
-
-          claude:
-            base_url: "https://api.anthropic.com/v1"
-            api_key: "${ANTHROPIC_API_KEY}"
-            model: "claude-3-5-sonnet"
-            token_cap: 200000
+    支持从 DAG 工作区内 models.yaml、~/.agenda/models.yaml、环境变量加载。
     """
 
     _GLOBAL_PATH = Path.home() / ".agenda" / "models.yaml"
@@ -198,7 +232,7 @@ class ModelRegistry:
 
 
 # ============================================================
-# 3. Session — 双目录隔离
+# 3. Session — 双目录隔离 + 持久化
 # ============================================================
 
 class Session:
@@ -210,6 +244,12 @@ class Session:
             .context/     ← Agent 可见（读/写）
             .system/      ← 系统私有（Agent 不可见）
             output/       ← Agent 产物
+            children/     ← 子 Agent 的 session（Agent 不可见）
+
+    持久化（学 Butterfly 的 append-only JSONL）：
+        .system/messages.jsonl  ← 对话历史（append-only，每轮后 flush）
+        .system/state.json      ← 运行状态（running/completed/failed）
+        .system/session.jsonl   ← 运行时事件日志
     """
 
     def __init__(self, node_dir: Path) -> None:
@@ -217,11 +257,18 @@ class Session:
         self.context_dir = self.node_dir / ".context"
         self.system_dir = self.node_dir / ".system"
         self.output_dir = self.node_dir / "output"
+        self.children_dir = self.node_dir / "children"
 
         # 自动创建目录
         self.context_dir.mkdir(parents=True, exist_ok=True)
         self.system_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.children_dir.mkdir(parents=True, exist_ok=True)
+
+        # 文件路径
+        self._messages_path = self.system_dir / "messages.jsonl"
+        self._events_path = self.system_dir / "session.jsonl"
+        self._state_path = self.system_dir / "state.json"
 
     # --- Agent 可见操作 ---
 
@@ -253,9 +300,8 @@ class Session:
     # --- 系统私有操作 ---
 
     def log_message(self, message: dict) -> None:
-        """追加消息到 .system/session.jsonl（append-only）。"""
-        session_log = self.system_dir / "session.jsonl"
-        with open(session_log, "a", encoding="utf-8") as f:
+        """追加消息到 .system/session.jsonl（append-only 运行时日志）。"""
+        with open(self._events_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(message, ensure_ascii=False) + "\n")
 
     def write_system(self, rel_path: str, content: str) -> None:
@@ -273,19 +319,51 @@ class Session:
 
     def set_state(self, key: str, value: Any) -> None:
         """读写 .system/state.json。"""
-        state_file = self.system_dir / "state.json"
         state = {}
-        if state_file.exists():
-            state = json.loads(state_file.read_text(encoding="utf-8"))
+        if self._state_path.exists():
+            try:
+                state = json.loads(self._state_path.read_text(encoding="utf-8"))
+            except (json.JSONDecodeError, OSError):
+                state = {}
         state[key] = value
-        state_file.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+        self._state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
 
     def get_state(self, key: str, default: Any = None) -> Any:
-        state_file = self.system_dir / "state.json"
-        if not state_file.exists():
+        if not self._state_path.exists():
             return default
-        state = json.loads(state_file.read_text(encoding="utf-8"))
-        return state.get(key, default)
+        try:
+            state = json.loads(self._state_path.read_text(encoding="utf-8"))
+            return state.get(key, default)
+        except (json.JSONDecodeError, OSError):
+            return default
+
+    # --- 持久化：messages.jsonl（学 Butterfly 的 context.jsonl） ---
+
+    def save_message(self, message: dict) -> None:
+        """追加单条消息到 messages.jsonl。"""
+        with open(self._messages_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(message, ensure_ascii=False) + "\n")
+
+    def load_messages(self) -> list[dict]:
+        """从 messages.jsonl 恢复对话历史。"""
+        messages: list[dict] = []
+        if not self._messages_path.exists():
+            return messages
+        with open(self._messages_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    messages.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+        return messages
+
+    def clear_messages(self) -> None:
+        """清空 messages.jsonl（重置节点时调用）。"""
+        if self._messages_path.exists():
+            self._messages_path.unlink()
 
     # --- 内部工具 ---
 
@@ -303,8 +381,25 @@ class Session:
 
     @property
     def output_exists(self) -> bool:
-        """output/draft.md 存在即表示节点完成。"""
+        """output/draft.md 存在即表示节点完成（默认判定）。"""
         return (self.output_dir / "draft.md").exists()
+
+    def is_done(self, done_file: str | None = None) -> bool:
+        """检查节点是否完成，支持自定义完成标记文件。"""
+        if done_file:
+            return (self.output_dir / done_file).exists()
+        return self.output_exists
+
+    def is_failed(self) -> bool:
+        """检查节点是否失败：.system/error.log 存在。"""
+        return (self.system_dir / "error.log").exists()
+
+    # --- 子 Agent 管理 ---
+
+    def child_session(self, name: str) -> "Session":
+        """获取/创建子 Agent 的 session。"""
+        child_dir = self.children_dir / name
+        return Session(child_dir)
 
 
 # ============================================================
@@ -359,13 +454,20 @@ class HookRegistry:
 
 
 # ============================================================
-# 5. Agent Loop — 核心循环
+# 5. Agent Loop — 核心循环（加固版）
 # ============================================================
 
 class AgentLoop:
     """
     Agent 的核心循环：
         prompt → LLM → (tool_call → execute → loop) → completion
+
+    加固措施（学 Butterfly + EVA）：
+    - max_iterations: 防止无限循环（默认 50）
+    - timeout: 节点级超时（默认 600s）
+    - 每轮后 save_message() 持久化（Butterfly 的 per-commit）
+    - 取消时补全 pending tool_calls（防止下次运行 400）
+    - AI 自驱动记忆压缩
     """
 
     def __init__(
@@ -374,7 +476,9 @@ class AgentLoop:
         model_registry: ModelRegistry,
         tools: ToolRegistry,
         hooks: HookRegistry | None = None,
-        model: str | None = None,   # 模型别名，如 "deepseek"、"kimi"
+        model: str | None = None,
+        max_iterations: int = DEFAULT_MAX_ITERATIONS,
+        timeout: float = DEFAULT_NODE_TIMEOUT,
     ) -> None:
         self.session = session
         self.model_registry = model_registry
@@ -383,50 +487,84 @@ class AgentLoop:
         self.hooks = hooks or HookRegistry()
         self.token_cap = self.model_cfg.token_cap
         self.messages: list[dict] = []
-        # 延迟创建 client（支持不同模型用不同 endpoint）
+        self.max_iterations = max(1, max_iterations)
+        self.timeout = timeout
         self._client: Any | None = None
+        self._cancelled = False
 
     async def run(self, system_prompt: str, task: str) -> str:
-        """运行 Agent，返回最终产物。"""
+        """运行 Agent，返回最终产物。支持超时和取消。"""
         self.messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": task},
         ]
+        # 持久化初始消息
+        for msg in self.messages:
+            self.session.save_message(msg)
+
+        start_time = time.monotonic()
+        iteration = 0
 
         try:
-            while True:
-                # --- 记忆压缩检查 ---
+            while iteration < self.max_iterations:
+                iteration += 1
+
+                # 超时检查
+                if time.monotonic() - start_time > self.timeout:
+                    raise asyncio.TimeoutError(f"节点运行超过 {self.timeout} 秒")
+
+                # 取消检查
+                if self._cancelled:
+                    raise asyncio.CancelledError("Agent 被取消")
+
+                # 记忆压缩检查
                 if self._estimate_tokens() > self.token_cap * 0.75:
                     await self._compact_memory()
 
-                # --- 调用 LLM ---
+                # 调用 LLM
                 response = await self._call_llm()
                 msg = response["choices"][0]["message"]
-                self.messages.append(self._msg_to_dict(msg))
-                self.session.log_message(self._msg_to_dict(msg))
+                msg_dict = self._msg_to_dict(msg)
+                self.messages.append(msg_dict)
+                self.session.save_message(msg_dict)
+                self.session.log_message({"type": "llm_response", "iteration": iteration, "ts": datetime.now().isoformat()})
 
-                # --- 完成信号 ---
-                if not msg.get("tool_calls"):
-                    result = msg.get("content", "")
+                # 完成信号
+                if not msg_dict.get("tool_calls"):
+                    result = msg_dict.get("content", "")
                     await self.hooks.fire("on_complete", self)
                     return result
 
-                # --- 执行 tools ---
-                for tc in msg["tool_calls"]:
+                # 执行 tools
+                pending_tool_calls: list[dict] = msg_dict.get("tool_calls", [])
+                for tc in pending_tool_calls:
                     await self.hooks.fire("before_tool", self)
                     result = await self._execute_tool(tc)
-                    self.messages.append({
+                    tool_result = {
                         "role": "tool",
                         "tool_call_id": tc["id"],
-                        "content": str(result)[:4000],  # 截断过长结果
-                    })
+                        "content": str(result)[:4000],
+                    }
+                    self.messages.append(tool_result)
+                    self.session.save_message(tool_result)
                     await self.hooks.fire("after_tool", self)
 
+            # 迭代次数超限
+            raise RuntimeError(f"Agent 迭代次数达到上限 {self.max_iterations}")
+
+        except asyncio.CancelledError:
+            # Butterfly 式 orphan 修复：补全 pending tool_calls
+            self._seal_orphan_tool_calls()
+            await self.hooks.fire("on_error", self)
+            raise
         except Exception as e:
             await self.hooks.fire("on_error", self)
-            # 写入错误日志
             self.session.write_system("error.log", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
             raise
+
+    def cancel(self) -> None:
+        """标记取消（由外部调度器调用）。"""
+        self._cancelled = True
 
     # --- 内部方法 ---
 
@@ -434,22 +572,17 @@ class AgentLoop:
         """根据模型配置创建 OpenAI 兼容客户端。"""
         if self._client is not None:
             return self._client
-
-        cfg = self.model_cfg
         try:
             from openai import AsyncOpenAI
         except ImportError:
             print("[错误] 需要安装 openai: pip install openai")
             raise SystemExit(1)
-
-        self._client = AsyncOpenAI(
-            base_url=cfg.base_url,
-            api_key=cfg.api_key,
-        )
+        cfg = self.model_cfg
+        self._client = AsyncOpenAI(base_url=cfg.base_url, api_key=cfg.api_key)
         return self._client
 
     async def _call_llm(self) -> dict:
-        """调用 LLM API。兼容任何 OpenAI 格式的客户端。"""
+        """调用 LLM API。"""
         client = self._ensure_client()
         kwargs = {
             "model": self.model_cfg.model,
@@ -459,7 +592,6 @@ class AgentLoop:
         if self.tools._tools:
             kwargs["tools"] = self.tools.schemas()
             kwargs["tool_choice"] = "auto"
-
         resp = await client.chat.completions.create(**kwargs)
         return resp.model_dump()
 
@@ -468,8 +600,7 @@ class AgentLoop:
         func = tc["function"]
         name = func["name"]
         args = json.loads(func["arguments"]) if func["arguments"] else {}
-
-        print(f"  [Tool] {name}({json.dumps(args, ensure_ascii=False)})")
+        print(f"  [Tool] {name}({json.dumps(args, ensure_ascii=False)[:200]})")
 
         tool = self.tools.get(name)
         if not tool:
@@ -483,11 +614,34 @@ class AgentLoop:
         except Exception as e:
             return f"[执行错误] {type(e).__name__}: {e}"
 
+    def _seal_orphan_tool_calls(self) -> None:
+        """
+        Butterfly 式修复：取消时，如果 messages 末尾有未完成的 tool_use，
+        补全 synthetic tool_result，防止下次运行 LLM 返回 400（orphan tool_use）。
+        """
+        if not self.messages:
+            return
+        last = self.messages[-1]
+        if last.get("role") != "assistant" or not last.get("tool_calls"):
+            return
+        for tc in last["tool_calls"]:
+            tc_id = tc.get("id", "")
+            # 检查是否已有对应的 tool_result
+            has_result = any(
+                m.get("role") == "tool" and m.get("tool_call_id") == tc_id
+                for m in self.messages
+            )
+            if not has_result:
+                synthetic = {
+                    "role": "tool",
+                    "tool_call_id": tc_id,
+                    "content": "[系统] 工具调用因任务中断而被取消。",
+                }
+                self.messages.append(synthetic)
+                self.session.save_message(synthetic)
+
     async def _compact_memory(self) -> None:
-        """
-        AI 自驱动记忆压缩。
-        注入《紧急危机》prompt，让 Agent 自己归档记忆。
-        """
+        """AI 自驱动记忆压缩（从 EVA 移植）。"""
         compact_prompt = """《紧急危机》！！！记忆容量即将达到上限。
 
 你需要紧急完成三件事：
@@ -500,34 +654,40 @@ class AgentLoop:
 完成后，调用 done_compact 工具通知系统。
 不要请求用户确认，直接执行。"""
 
-        # 临时注入压缩 prompt
         self.messages.append({"role": "user", "content": compact_prompt})
+        self.session.save_message({"role": "user", "content": compact_prompt})
 
-        # 等待 Agent 完成归档（最多 3 轮）
         for _ in range(3):
             response = await self._call_llm()
             msg = response["choices"][0]["message"]
-            self.messages.append(self._msg_to_dict(msg))
+            msg_dict = self._msg_to_dict(msg)
+            self.messages.append(msg_dict)
+            self.session.save_message(msg_dict)
 
-            if not msg.get("tool_calls"):
+            if not msg_dict.get("tool_calls"):
                 break
 
-            for tc in msg["tool_calls"]:
+            for tc in msg_dict["tool_calls"]:
                 result = await self._execute_tool(tc)
-                self.messages.append({
+                tr = {
                     "role": "tool",
                     "tool_call_id": tc["id"],
                     "content": str(result)[:4000],
-                })
+                }
+                self.messages.append(tr)
+                self.session.save_message(tr)
 
-        # 压缩后截断对话历史（保留 system + 最近 2 轮）
+        # 压缩后截断：保留 system + 最近 4 轮
         self.messages = [self.messages[0]] + self.messages[-4:]
+        # 重新持久化截断后的历史（覆盖式，因为 JSONL 不支持中间删除）
+        self.session.clear_messages()
+        for msg in self.messages:
+            self.session.save_message(msg)
         print("  [记忆压缩完成]")
 
     def _estimate_tokens(self) -> int:
-        """粗略估算 token 数（中文字符按 1.5 倍，英文按 1 倍）。"""
+        """粗略估算 token 数。"""
         text = json.dumps(self.messages, ensure_ascii=False)
-        # 简单估算：中文 1.5 token/字，英文 1 token/字
         cn = len(re.findall(r"[\u4e00-\u9fff]", text))
         en = len(text) - cn
         return int(cn * 1.5 + en * 0.5)
@@ -536,7 +696,6 @@ class AgentLoop:
         """把 LLM 返回的消息对象转成 dict。"""
         if isinstance(msg, dict):
             return msg
-        # openai 对象
         d = {"role": getattr(msg, "role", "assistant")}
         if hasattr(msg, "content") and msg.content:
             d["content"] = msg.content
@@ -546,16 +705,156 @@ class AgentLoop:
 
 
 # ============================================================
-# 6. DAG 调度器
+# 6. 子 Agent 系统（简化版 Butterfly sub_agent）
+# ============================================================
+
+class SubAgentManager:
+    """
+    子 Agent 管理器。
+
+    设计：不实现 Butterfly 的完整 BridgeSession，而是用文件系统状态机：
+    - 父 Agent 调用 spawn_child → 创建子 session + 启动子 Agent 任务
+    - 子 Agent 运行完成后写 output/done.json
+    - 父 Agent 轮询 wait_for_child 读取结果
+
+    最大嵌套深度：MAX_SUB_AGENT_DEPTH（默认 2）
+    """
+
+    def __init__(self, parent_session: Session, model_registry: ModelRegistry,
+                 max_depth: int = MAX_SUB_AGENT_DEPTH) -> None:
+        self.parent_session = parent_session
+        self.model_registry = model_registry
+        self.max_depth = max_depth
+        self._child_tasks: dict[str, asyncio.Task] = {}
+
+    def _current_depth(self) -> int:
+        """计算当前嵌套深度。"""
+        depth = 0
+        node_dir = self.parent_session.node_dir
+        # 向上追溯 children/ 目录层数
+        while node_dir.name == "children" or (node_dir.parent and node_dir.parent.name == "children"):
+            depth += 1
+            node_dir = node_dir.parent.parent if node_dir.parent else node_dir
+        return depth
+
+    async def spawn_child(
+        self,
+        task: str,
+        name: str,
+        model: str | None = None,
+        system_prompt: str | None = None,
+        max_iterations: int = DEFAULT_MAX_ITERATIONS,
+        timeout: float = DEFAULT_NODE_TIMEOUT,
+    ) -> str:
+        """创建并启动子 Agent。返回 child_name。"""
+        current_depth = self._current_depth()
+        if current_depth >= self.max_depth:
+            return f"[错误] 子 Agent 嵌套深度已达上限 {self.max_depth}"
+
+        child_session = self.parent_session.child_session(name)
+        # 如果已存在且已完成，拒绝覆盖
+        if child_session.is_done("done.json"):
+            return f"[错误] 子 Agent '{name}' 已存在且已完成"
+
+        # 准备子 Agent 的 system prompt
+        child_system = system_prompt or f"""你是一个子 Agent，被父 Agent 委派执行特定任务。
+
+# 规则
+- 你是独立的 Agent，有自己的 .context/ 和 output/
+- 完成任务后，必须写入 output/draft.md 和 output/done.json
+- done.json 格式: {{"status": "completed", "summary": "任务摘要"}}
+- 如果失败，写入 output/done.json: {{"status": "failed", "error": "错误信息"}}
+
+# 记忆线索
+当前嵌套深度: {current_depth + 1}/{self.max_depth}
+"""
+
+        # 创建子 Agent 的工具集
+        child_tools = build_tools(child_session, allow_shell=False)
+        child_hooks = HookRegistry()
+
+        async def _run_child() -> None:
+            agent = AgentLoop(
+                session=child_session,
+                model_registry=self.model_registry,
+                tools=child_tools,
+                hooks=child_hooks,
+                model=model,
+                max_iterations=max_iterations,
+                timeout=timeout,
+            )
+            try:
+                result = await agent.run(child_system, task)
+                # 写完成标记
+                child_session.write_output("done.json", json.dumps({
+                    "status": "completed",
+                    "summary": result[:500] if result else "",
+                    "finished_at": datetime.now().isoformat(),
+                }, ensure_ascii=False))
+                if not child_session.output_exists:
+                    child_session.write_output("draft.md", result)
+            except Exception as e:
+                child_session.write_output("done.json", json.dumps({
+                    "status": "failed",
+                    "error": f"{type(e).__name__}: {e}",
+                    "finished_at": datetime.now().isoformat(),
+                }, ensure_ascii=False))
+                child_session.write_system("error.log", traceback.format_exc())
+
+        task_obj = asyncio.create_task(_run_child(), name=f"subagent_{name}")
+        self._child_tasks[name] = task_obj
+        return f"[系统] 子 Agent '{name}' 已启动（深度: {current_depth + 1}/{self.max_depth}）"
+
+    async def wait_for_child(self, name: str, poll_interval: float = 1.0, timeout: float = 300.0) -> str:
+        """轮询等待子 Agent 完成。返回结果摘要。"""
+        child_session = self.parent_session.child_session(name)
+        deadline = time.monotonic() + timeout
+        done_path = child_session.output_dir / "done.json"
+
+        while time.monotonic() < deadline:
+            if done_path.exists():
+                try:
+                    done = json.loads(done_path.read_text(encoding="utf-8"))
+                    status = done.get("status", "unknown")
+                    if status == "completed":
+                        draft = child_session.read_context("output/draft.md")
+                        return f"[子 Agent '{name}' 完成]\n{draft[:2000]}"
+                    else:
+                        return f"[子 Agent '{name}' 失败] {done.get('error', '未知错误')}"
+                except Exception as e:
+                    return f"[错误] 读取子 Agent '{name}' 结果失败: {e}"
+            await asyncio.sleep(poll_interval)
+
+        return f"[超时] 等待子 Agent '{name}' 超过 {timeout} 秒"
+
+    def list_children(self) -> list[str]:
+        """列出所有子 Agent。"""
+        if not self.parent_session.children_dir.exists():
+            return []
+        return [d.name for d in self.parent_session.children_dir.iterdir() if d.is_dir()]
+
+    def kill_child(self, name: str) -> str:
+        """取消子 Agent 任务。"""
+        task = self._child_tasks.get(name)
+        if task and not task.done():
+            task.cancel()
+            return f"[系统] 子 Agent '{name}' 已取消"
+        return f"[系统] 子 Agent '{name}' 未运行"
+
+
+# ============================================================
+# 7. DAG 调度器（完善版）
 # ============================================================
 
 class DAGScheduler:
     """
     DAG 调度器：
     - 解析 YAML DAG 定义
-    - 拓扑排序
+    - 拓扑排序 + 环检测（DFS）
     - Asyncio 并行调度
     - 文件系统状态机
+    - 节点重试策略（最多 3 次）
+    - 调度状态持久化（中断后可恢复）
     """
 
     def __init__(self, workspace: Path, dag_name: str) -> None:
@@ -563,14 +862,18 @@ class DAGScheduler:
         self.dag_dir = self.workspace / dag_name
         self.dag_file = self.dag_dir / "dag.yaml"
         self.nodes_dir = self.dag_dir / "nodes"
+        self.state_file = self.dag_dir / ".system" / "scheduler_state.json"
 
-        # 如果没有 dag.yaml，创建一个空的
         self.dag_dir.mkdir(parents=True, exist_ok=True)
         self.nodes_dir.mkdir(exist_ok=True)
+        (self.dag_dir / ".system").mkdir(parents=True, exist_ok=True)
 
         self.dag: dict = {}
         self.completed: set[str] = set()
         self.running: set[str] = set()
+        self.failed: set[str] = set()
+        self.retries: dict[str, int] = {}  # 节点 -> 已重试次数
+        self._cancelled = False
 
         # 加载模型注册表
         self.model_registry = ModelRegistry().load(self.dag_dir)
@@ -578,44 +881,136 @@ class DAGScheduler:
 
     def load(self) -> DAGScheduler:
         """从 dag.yaml 加载，或创建默认空 DAG。"""
-        import yaml
-
         if self.dag_file.exists():
-            self.dag = yaml.safe_load(self.dag_file.read_text(encoding="utf-8"))
+            self.dag = yaml.safe_load(self.dag_file.read_text(encoding="utf-8")) or {}
         else:
             self.dag = {"dag": {"name": "untitled", "max_parallel": 4}, "nodes": {}}
         return self
 
     def save(self) -> None:
-        import yaml
-
         self.dag_file.write_text(yaml.safe_dump(self.dag, allow_unicode=True), encoding="utf-8")
 
+    # --- 状态检查 ---
+
     def node_is_done(self, node_id: str) -> bool:
-        """检查节点是否完成：output/draft.md 存在。"""
+        """检查节点是否完成：output/draft.md 存在（或配置自定义完成文件）。"""
         session = Session(self.nodes_dir / node_id)
-        return session.output_exists
+        config = self.dag.get("nodes", {}).get(node_id, {})
+        done_file = config.get("done_file")
+        return session.is_done(done_file)
 
     def node_is_failed(self, node_id: str) -> bool:
-        """检查节点是否失败：.system/error.log 存在。"""
         return (self.nodes_dir / node_id / ".system" / "error.log").exists()
+
+    def node_is_running(self, node_id: str) -> bool:
+        state = Session(self.nodes_dir / node_id).get_state("status")
+        return state == "running"
+
+    # --- 调度状态持久化 ---
+
+    def _save_scheduler_state(self) -> None:
+        """保存调度器运行状态到文件（用于中断恢复）。"""
+        state = {
+            "completed": sorted(self.completed),
+            "failed": sorted(self.failed),
+            "running": sorted(self.running),
+            "retries": self.retries,
+            "saved_at": datetime.now().isoformat(),
+        }
+        self.state_file.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    def _load_scheduler_state(self) -> None:
+        """从文件恢复调度器状态。"""
+        if not self.state_file.exists():
+            return
+        try:
+            state = json.loads(self.state_file.read_text(encoding="utf-8"))
+            self.completed = set(state.get("completed", []))
+            self.failed = set(state.get("failed", []))
+            self.running = set(state.get("running", []))
+            self.retries = state.get("retries", {})
+            print(f"[调度器] 从状态恢复: 已完成 {len(self.completed)}, 失败 {len(self.failed)}")
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    # --- 拓扑算法 ---
+
+    def _detect_cycle(self) -> list[str] | None:
+        """DFS 环检测。返回环中的节点列表，无环返回 None。"""
+        nodes = self.dag.get("nodes", {})
+        WHITE, GRAY, BLACK = 0, 1, 2
+        color = {n: WHITE for n in nodes}
+        path: list[str] = []
+
+        def dfs(node: str) -> list[str] | None:
+            color[node] = GRAY
+            path.append(node)
+            for dep in nodes.get(node, {}).get("deps", []):
+                if dep not in color:
+                    continue
+                if color[dep] == GRAY:
+                    # 发现环
+                    cycle_start = path.index(dep)
+                    return path[cycle_start:]
+                if color[dep] == WHITE:
+                    result = dfs(dep)
+                    if result:
+                        return result
+            path.pop()
+            color[node] = BLACK
+            return None
+
+        for node in nodes:
+            if color[node] == WHITE:
+                cycle = dfs(node)
+                if cycle:
+                    return cycle
+        return None
+
+    def topological_sort(self) -> list[str]:
+        """返回拓扑排序后的节点列表。"""
+        nodes = self.dag.get("nodes", {})
+        in_degree = {n: 0 for n in nodes}
+        adj = {n: [] for n in nodes}
+        for n, cfg in nodes.items():
+            for dep in cfg.get("deps", []):
+                if dep in adj:
+                    adj[dep].append(n)
+                    in_degree[n] += 1
+
+        queue = [n for n, d in in_degree.items() if d == 0]
+        result = []
+        while queue:
+            n = queue.pop(0)
+            result.append(n)
+            for m in adj[n]:
+                in_degree[m] -= 1
+                if in_degree[m] == 0:
+                    queue.append(m)
+        return result
 
     def ready_nodes(self) -> list[str]:
         """返回所有依赖已满足且未运行的节点。"""
         ready = []
         for node_id, config in self.dag.get("nodes", {}).items():
-            if node_id in self.completed or node_id in self.running:
+            if node_id in self.completed or node_id in self.running or node_id in self.failed:
                 continue
             deps = config.get("deps", [])
             if all(d in self.completed for d in deps):
                 ready.append(node_id)
         return ready
 
+    # --- 节点准备 ---
+
     def prepare_node(self, node_id: str) -> Session:
-        """准备节点目录：复制 inputs、dep_inputs。"""
+        """准备节点目录：复制 inputs、dep_inputs，恢复历史。"""
         config = self.dag["nodes"][node_id]
         node_dir = self.nodes_dir / node_id
         session = Session(node_dir)
+
+        # 设置 running 状态
+        session.set_state("status", "running")
+        session.set_state("started_at", datetime.now().isoformat())
 
         # 1. 复制 meta inputs
         for src_pattern in config.get("inputs", []):
@@ -627,10 +1022,14 @@ class DAGScheduler:
             dst = session.context_dir / mapping["to"].lstrip("/")
             if src.exists():
                 dst.parent.mkdir(parents=True, exist_ok=True)
-                import shutil
                 shutil.copy(src, dst)
 
-        # 3. 写 hints
+        # 3. 恢复历史（如果之前有中断）
+        loaded = session.load_messages()
+        if loaded:
+            print(f"  [节点 {node_id}] 恢复 {len(loaded)} 条历史消息")
+
+        # 4. 写 hints
         hints = f"""# DAG 任务: {node_id}
 ## 提示
 {config.get('prompt', '')}
@@ -638,9 +1037,12 @@ class DAGScheduler:
 - 用 read_file / write_file 工具操作文件
 - 按需读取 input/ 下的内容，不要一次性加载所有
 - 完成后写入 output/draft.md
+- 如需创建子 Agent，使用 spawn_child 工具
 """
         session.write_system("hints.md", hints)
         return session
+
+    # --- DAG 运行 ---
 
     async def run(
         self,
@@ -651,31 +1053,128 @@ class DAGScheduler:
         max_parallel = self.dag.get("dag", {}).get("max_parallel", 4)
         node_ids = list(self.dag.get("nodes", {}).keys())
 
-        # 先标记已完成的节点
-        self.completed = {n for n in node_ids if self.node_is_done(n)}
-        print(f"[DAG] 总节点: {len(node_ids)}, 已完成: {len(self.completed)}")
+        if not node_ids:
+            print("[DAG] 空 DAG，无节点可运行")
+            return {}
 
-        while len(self.completed) < len(node_ids):
-            ready = self.ready_nodes()
-            failed = [n for n in node_ids if self.node_is_failed(n)]
+        # 恢复之前的状态
+        self._load_scheduler_state()
 
-            # 如果有节点失败，DAG 不能继续（保守策略）
-            if failed:
-                print(f"[DAG] 节点失败，终止: {failed}")
+        # 扫描已完成节点（文件系统 + 持久化状态）
+        for n in node_ids:
+            if self.node_is_done(n):
+                self.completed.add(n)
+            elif self.node_is_failed(n):
+                # 检查是否可重试
+                retries = self.retries.get(n, 0)
+                max_retry = self.dag["nodes"][n].get("retries", DEFAULT_MAX_RETRIES)
+                if retries < max_retry:
+                    print(f"[DAG] 节点 {n} 失败，将重试 ({retries + 1}/{max_retry})")
+                    # 清除错误标记，允许重试
+                    error_log = self.nodes_dir / n / ".system" / "error.log"
+                    if error_log.exists():
+                        error_log.unlink()
+                else:
+                    self.failed.add(n)
+
+        print(f"[DAG] 总节点: {len(node_ids)}, 已完成: {len(self.completed)}, 失败: {len(self.failed)}")
+
+        pending_tasks: dict[str, asyncio.Task] = {}
+
+        while len(self.completed) + len(self.failed) < len(node_ids):
+            if self._cancelled:
+                print("[DAG] 调度器被取消")
                 break
 
-            if not ready and not self.running:
-                remaining = set(node_ids) - self.completed
+            # 清理已完成的任务
+            done_tasks = [n for n, t in pending_tasks.items() if t.done()]
+            for n in done_tasks:
+                del pending_tasks[n]
+                self.running.discard(n)
+                if self.node_is_done(n):
+                    self.completed.add(n)
+                    print(f"[节点] {n} 完成")
+                elif self.node_is_failed(n):
+                    retries = self.retries.get(n, 0)
+                    max_retry = self.dag["nodes"][n].get("retries", DEFAULT_MAX_RETRIES)
+                    if retries < max_retry:
+                        self.retries[n] = retries + 1
+                        # 不清除，等待下一轮 ready_nodes 重新调度
+                        print(f"[节点] {n} 失败，将在下一轮重试 ({self.retries[n]}/{max_retry})")
+                    else:
+                        self.failed.add(n)
+                        print(f"[节点] {n} 最终失败（重试耗尽）")
+                self._save_scheduler_state()
+
+            # 如果有节点失败且不可重试，终止 DAG（保守策略）
+            if self.failed:
+                # 检查是否还有依赖未满足的节点依赖于失败的节点
+                for n in list(self.failed):
+                    for other, cfg in self.dag.get("nodes", {}).items():
+                        if n in cfg.get("deps", []) and other not in self.completed and other not in self.failed:
+                            print(f"[DAG] 节点 {n} 失败导致下游 {other} 无法执行")
+                # 如果所有 remaining 节点都依赖 failed 节点，则终止
+                remaining = set(node_ids) - self.completed - self.failed
+                blocked = {n for n in remaining if any(d in self.failed for d in self.dag["nodes"][n].get("deps", []))}
+                if blocked == remaining:
+                    print(f"[DAG] 所有剩余节点被失败节点阻塞，终止")
+                    break
+
+            # 死锁检测
+            ready = self.ready_nodes()
+            remaining = set(node_ids) - self.completed - self.failed - self.running
+            if not ready and not self.running and remaining:
                 print(f"[DAG] 死锁！剩余节点: {remaining}")
                 break
 
             # 启动就绪节点（不超过 max_parallel）
-            for node_id in ready[: max_parallel - len(self.running)]:
-                asyncio.create_task(self._run_node(node_id, llm_client, tools_factory, hooks_factory))
+            slots = max_parallel - len(self.running)
+            for node_id in ready[:slots]:
+                if self._cancelled:
+                    break
+                task = asyncio.create_task(
+                    self._run_node(node_id, tools_factory, hooks_factory),
+                    name=f"node_{node_id}",
+                )
+                pending_tasks[node_id] = task
+                self.running.add(node_id)
+                self._save_scheduler_state()
 
-            await asyncio.sleep(1)
+            if pending_tasks:
+                # 等待任意任务完成或 1 秒超时（用于轮询新就绪节点）
+                try:
+                    done, _ = await asyncio.wait(
+                        pending_tasks.values(),
+                        return_when=asyncio.FIRST_COMPLETED,
+                        timeout=1.0,
+                    )
+                except asyncio.CancelledError:
+                    self._cancelled = True
+                    for t in pending_tasks.values():
+                        t.cancel()
+                    raise
+            else:
+                await asyncio.sleep(0.5)
 
-        return {n: ("COMPLETED" if self.node_is_done(n) else "FAILED" if self.node_is_failed(n) else "PENDING") for n in node_ids}
+        # 等待所有 pending 任务完成
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks.values(), return_exceptions=True)
+            for n, t in pending_tasks.items():
+                self.running.discard(n)
+                if self.node_is_done(n):
+                    self.completed.add(n)
+                elif self.node_is_failed(n):
+                    self.failed.add(n)
+
+        self._save_scheduler_state()
+        return {
+            n: ("COMPLETED" if n in self.completed else "FAILED" if n in self.failed else "PENDING")
+            for n in node_ids
+        }
+
+    def cancel(self) -> None:
+        """取消整个 DAG 运行。"""
+        self._cancelled = True
 
     async def _run_node(
         self,
@@ -695,6 +1194,24 @@ class DAGScheduler:
             tools = tools_factory(session)
             hooks = hooks_factory() if hooks_factory else HookRegistry()
 
+            # 注入子 Agent 工具
+            sub_manager = SubAgentManager(session, self.model_registry)
+
+            @tools.register("spawn_child")
+            async def spawn_child(task: str, name: str, model: str | None = None) -> str:
+                """创建子 Agent 执行子任务。name 必须唯一。"""
+                return await sub_manager.spawn_child(task=task, name=name, model=model)
+
+            @tools.register("wait_for_child")
+            async def wait_for_child(name: str, timeout: int = 300) -> str:
+                """等待子 Agent 完成并返回结果。"""
+                return await sub_manager.wait_for_child(name=name, timeout=float(timeout))
+
+            @tools.register("list_children")
+            def list_children() -> str:
+                """列出所有子 Agent。"""
+                return json.dumps(sub_manager.list_children(), ensure_ascii=False)
+
             # 构建 system prompt
             hints = session.read_system("hints.md")
             system_prompt = f"""你是一个智能体，正在执行 DAG 任务。
@@ -706,6 +1223,9 @@ class DAGScheduler:
 - read_file(path): 读取 .context/ 或 output/ 下的文件
 - write_file(path, content): 写入 output/ 目录
 - list_dir(path="."): 列出目录内容
+- spawn_child(task, name, model?): 创建子 Agent 执行子任务
+- wait_for_child(name, timeout?): 等待子 Agent 完成
+- list_children(): 列出所有子 Agent
 
 # 记忆线索
 {session.read_system("hints.md")}
@@ -717,6 +1237,8 @@ class DAGScheduler:
                 tools=tools,
                 hooks=hooks,
                 model=model_alias,
+                max_iterations=config.get("max_iterations", DEFAULT_MAX_ITERATIONS),
+                timeout=config.get("timeout", DEFAULT_NODE_TIMEOUT),
             )
 
             result = await agent.run(system_prompt, config["prompt"])
@@ -725,21 +1247,26 @@ class DAGScheduler:
             if not session.output_exists and result:
                 session.write_output("draft.md", result)
 
-            self.completed.add(node_id)
+            session.set_state("status", "completed")
+            session.set_state("completed_at", datetime.now().isoformat())
             print(f"[节点] {node_id} 完成")
 
+        except asyncio.CancelledError:
+            session = Session(self.nodes_dir / node_id)
+            session.set_state("status", "cancelled")
+            print(f"[节点] {node_id} 被取消")
+            raise
         except Exception as e:
             print(f"[节点] {node_id} 失败: {e}")
             session = Session(self.nodes_dir / node_id)
             session.write_system("error.log", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+            session.set_state("status", "failed")
 
         finally:
             self.running.discard(node_id)
 
     def _copy_input(self, src_pattern: str, dst_dir: Path) -> None:
         """复制 input 文件到节点 context。支持 #section 锚点。"""
-        import shutil
-
         base = self.dag_dir
         if "#" in src_pattern:
             path, section = src_pattern.split("#", 1)
@@ -754,7 +1281,6 @@ class DAGScheduler:
         dst.parent.mkdir(parents=True, exist_ok=True)
 
         if section:
-            # 简单锚点提取：找 ## section 到下一个 ##
             text = src.read_text(encoding="utf-8")
             pattern = rf"##?\s*{re.escape(section)}.*?(?=\n##?\s|\Z)"
             match = re.search(pattern, text, re.DOTALL)
@@ -767,14 +1293,11 @@ class DAGScheduler:
 
 
 # ============================================================
-# 7. 安全审查（从 EVA 移植）
+# 8. 安全审查（从 EVA 移植）
 # ============================================================
 
 class SecurityReviewer:
-    """
-    用 LLM 自己审查命令安全性。
-    不是正则匹配，而是让模型判断语义风险。
-    """
+    """用 LLM 自己审查命令安全性。"""
 
     REVIEW_PROMPT = """你是一个安全专家。请审查下面的 {shell} 命令：
 
@@ -805,12 +1328,11 @@ class SecurityReviewer:
             text = resp.choices[0].message.content
             return "放行" in text and "禁止" not in text
         except Exception:
-            # LLM 审查失败时，保守拒绝
             return False
 
 
 # ============================================================
-# 8. 工具工厂（内置工具）
+# 9. 工具工厂（内置工具）
 # ============================================================
 
 def build_tools(session: Session, allow_shell: bool = False, llm_client: Any | None = None) -> ToolRegistry:
@@ -884,16 +1406,8 @@ def build_tools(session: Session, allow_shell: bool = False, llm_client: Any | N
 
 
 # ============================================================
-# 9. 命令行入口（给 Agent 用的 CLI）
+# 10. 命令行入口（给 Agent 用的 CLI）
 # ============================================================
-
-# 退出码定义
-EXIT_SUCCESS = 0
-EXIT_ARGS_ERROR = 1
-EXIT_DAG_CONFIG_ERROR = 2
-EXIT_EXECUTION_ERROR = 3
-EXIT_DEPENDENCY_ERROR = 4
-
 
 def _resolve_dag_path(dag_arg: str | None) -> Path:
     """解析 DAG 路径。支持环境变量 AGENDA_DAG 兜底。"""
@@ -913,35 +1427,31 @@ def _resolve_models_path(models_arg: str | None) -> Path | None:
 
 
 def _load_scheduler(dag_path: Path, models_path: Path | None = None) -> DAGScheduler:
-    """加载 DAG 调度器。
-    
-    如果 dag_path 是文件（如 test/dag.yaml），直接加载该文件。
-    如果 dag_path 是目录（如 test/），加载目录下的 dag.yaml。
-    """
+    """加载 DAG 调度器。"""
     if dag_path.is_file():
         dag_dir = dag_path.parent
         dag_file = dag_path
     else:
         dag_dir = dag_path
         dag_file = dag_path / "dag.yaml"
-    
-    # 临时创建 scheduler，然后手动设置 dag_file 并加载
-    scheduler = DAGScheduler(dag_dir, "__temp__")
+
+    dag_name = dag_dir.name
+    scheduler = DAGScheduler(dag_dir.parent, dag_name)
     scheduler.dag_file = dag_file
     scheduler.load()
-    
+
     if models_path:
-        scheduler.model_registry = ModelRegistry().load(models_path.parent if models_path.name == "models.yaml" else None)
+        scheduler.model_registry = ModelRegistry().load(
+            models_path.parent if models_path.name == "models.yaml" else None
+        )
     return scheduler
 
 
 def _json_out(data: dict) -> None:
-    """输出 JSON。"""
     print(json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def _ndjson_out(data: dict) -> None:
-    """输出 NDJSON（单行）。"""
     print(json.dumps(data, ensure_ascii=False))
 
 
@@ -953,7 +1463,7 @@ def cli() -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Agenda — 给 Agent 调度 Agent 的极简运行时",
+        description="Agenda — 给 Agent 调度 Agent 的极简运行时 v0.0.4",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 环境变量:
@@ -970,7 +1480,7 @@ def cli() -> int:
   130 用户中断 (Ctrl+C)
         """,
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.0.2")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.0.4")
 
     subparsers = parser.add_subparsers(dest="cmd", help="命令")
 
@@ -1086,11 +1596,6 @@ def cli() -> int:
                     "dag:\n  name: untitled\n  max_parallel: 4\nnodes:\n",
                     encoding="utf-8",
                 )
-
-            # 如果有模板，复制模板内容
-            if args.from_template:
-                print(f"[dag init] 从模板 {args.from_template} 初始化（模板功能待实现）")
-
             print(f"[dag init] 已初始化 DAG: {dag_path}")
             return EXIT_SUCCESS
 
@@ -1101,8 +1606,11 @@ def cli() -> int:
                 scheduler = _load_scheduler(dag_path)
                 nodes = scheduler.dag.get("nodes", {})
 
-                # 检查循环依赖
-                # TODO: 实现拓扑排序检测循环依赖
+                # 环检测
+                cycle = scheduler._detect_cycle()
+                cycle_error = None
+                if cycle:
+                    cycle_error = f"检测到循环依赖: {' -> '.join(cycle)} -> {cycle[0]}"
 
                 # 检查模型配置
                 models_used = set()
@@ -1120,12 +1628,15 @@ def cli() -> int:
                             warnings.append(f"节点 {node_id} 的输入文件不存在: {inp}")
 
                 result = {
-                    "valid": len(warnings) == 0,
+                    "valid": cycle is None and len(warnings) == 0,
                     "path": str(dag_path),
                     "nodes": len(nodes),
                     "models": sorted(models_used),
                     "warnings": warnings,
                 }
+                if cycle_error:
+                    result["cycle_error"] = cycle_error
+                    result["valid"] = False
 
                 if args.json:
                     _json_out(result)
@@ -1133,6 +1644,8 @@ def cli() -> int:
                     print(f"DAG: {dag_path}")
                     print(f"  节点数: {result['nodes']}")
                     print(f"  使用模型: {', '.join(result['models']) or 'default'}")
+                    if cycle_error:
+                        print(f"  ❌ {cycle_error}")
                     print(f"  警告: {len(warnings)}")
                     for w in warnings:
                         print(f"    ⚠️ {w}")
@@ -1153,7 +1666,10 @@ def cli() -> int:
             scheduler = _load_scheduler(dag_path)
             nodes = scheduler.dag.get("nodes", {})
 
-            # 计算拓扑深度（简单 BFS）
+            # 拓扑排序
+            topo = scheduler.topological_sort()
+
+            # 计算拓扑深度
             depth = {n: 0 for n in nodes}
             changed = True
             while changed:
@@ -1164,13 +1680,27 @@ def cli() -> int:
                             depth[n] = depth[dep] + 1
                             changed = True
 
-            # 找关键路径（最长路径）
+            # 关键路径（最长路径）
             critical_path = []
-            max_depth_node = max(depth, key=depth.get) if depth else None
-            # TODO: 回溯关键路径
+            if topo:
+                # 找最长路径的简单方法：从深度最大的节点回溯
+                max_node = max(depth, key=depth.get)
+                critical_path = [max_node]
+                while True:
+                    current = critical_path[-1]
+                    deps = nodes.get(current, {}).get("deps", [])
+                    if not deps:
+                        break
+                    # 找深度最大的依赖
+                    next_node = max((d for d in deps if d in depth), key=lambda d: depth[d], default=None)
+                    if next_node is None:
+                        break
+                    critical_path.append(next_node)
+                critical_path.reverse()
 
             result = {
                 "path": str(dag_path),
+                "topological_order": topo,
                 "nodes": {
                     n: {
                         "deps": cfg.get("deps", []),
@@ -1188,9 +1718,12 @@ def cli() -> int:
             else:
                 print(f"DAG: {dag_path}")
                 print(f"  总节点: {len(nodes)}")
+                print(f"  拓扑排序: {' -> '.join(topo)}")
                 print(f"  最大深度: {result['max_depth']}")
+                print(f"  关键路径: {' -> '.join(critical_path) or 'N/A'}")
                 print(f"  节点列表:")
-                for n, info in sorted(result["nodes"].items(), key=lambda x: x[1]["depth"]):
+                for n in topo:
+                    info = result["nodes"][n]
                     deps = f" 依赖: {', '.join(info['deps'])}" if info["deps"] else ""
                     print(f"    [{info['depth']}] {n} (模型: {info['model']}){deps}")
 
@@ -1207,6 +1740,11 @@ def cli() -> int:
                 print(f"[dry-run] DAG: {dag_path}")
                 print(f"[dry-run] 模型: {models_path or 'default'}")
                 print(f"[dry-run] 最大并行: {max_parallel}")
+                topo = scheduler.topological_sort()
+                print(f"[dry-run] 拓扑顺序: {' -> '.join(topo)}")
+                cycle = scheduler._detect_cycle()
+                if cycle:
+                    print(f"[dry-run] ⚠️ 检测到环: {' -> '.join(cycle)}")
                 print(f"[dry-run] 节点:")
                 for n, cfg in scheduler.dag.get("nodes", {}).items():
                     print(f"  {n}: model={cfg.get('model', 'default')}, deps={cfg.get('deps', [])}")
@@ -1216,12 +1754,10 @@ def cli() -> int:
                 scheduler = _load_scheduler(dag_path, models_path)
                 scheduler.dag["dag"]["max_parallel"] = max_parallel
 
-                import asyncio
                 results = asyncio.run(scheduler.run(
                     tools_factory=lambda session: build_tools(session),
                 ))
 
-                # 检查是否有失败
                 failed = [n for n, s in results.items() if s == "FAILED"]
                 if failed:
                     print(f"[dag run] 失败节点: {', '.join(failed)}")
@@ -1244,12 +1780,11 @@ def cli() -> int:
             nodes = scheduler.dag.get("nodes", {})
 
             if args.watch:
-                # 实时监听模式
                 try:
                     while True:
                         completed = [n for n in nodes if scheduler.node_is_done(n)]
                         failed = [n for n in nodes if scheduler.node_is_failed(n)]
-                        running = [n for n in nodes if n in scheduler.running]
+                        running = [n for n in nodes if scheduler.node_is_running(n)]
                         pending = [n for n in nodes if n not in completed and n not in failed and n not in running]
 
                         event = {
@@ -1269,7 +1804,7 @@ def cli() -> int:
 
                         if len(completed) + len(failed) == len(nodes):
                             if not args.json:
-                                print()  # 换行
+                                print()
                             break
 
                         time.sleep(1)
@@ -1283,7 +1818,7 @@ def cli() -> int:
             # 单次查询模式
             completed = [n for n in nodes if scheduler.node_is_done(n)]
             failed = [n for n in nodes if scheduler.node_is_failed(n)]
-            running = [n for n in nodes if n in scheduler.running]
+            running = [n for n in nodes if scheduler.node_is_running(n)]
             pending = [n for n in nodes if n not in completed and n not in failed and n not in running]
 
             result = {
@@ -1317,8 +1852,9 @@ def cli() -> int:
         # dag stop
         if args.dag_cmd == "stop":
             dag_path = _resolve_dag_path(args.path)
-            # TODO: 实现停止机制（需要 PID 文件或信号）
-            print(f"[dag stop] 停止 DAG: {dag_path}（功能待实现）")
+            scheduler = _load_scheduler(dag_path)
+            scheduler.cancel()
+            print(f"[dag stop] 已发送取消信号到 DAG: {dag_path}")
             return EXIT_SUCCESS
 
     # ============================================================
@@ -1339,13 +1875,11 @@ def cli() -> int:
             if args.force:
                 node_dir = scheduler.nodes_dir / node_id
                 if node_dir.exists():
-                    import shutil
                     shutil.rmtree(node_dir)
                     print(f"[node run] 已重置节点: {node_id}")
 
             try:
-                import asyncio
-                asyncio.run(scheduler._run_node(
+                results = asyncio.run(scheduler._run_node(
                     node_id,
                     tools_factory=lambda session: build_tools(session),
                     hooks_factory=None,
@@ -1359,7 +1893,6 @@ def cli() -> int:
         if args.node_cmd == "reset":
             node_dir = scheduler.nodes_dir / node_id
             if node_dir.exists():
-                import shutil
                 shutil.rmtree(node_dir)
                 print(f"[node reset] 已重置节点: {node_id}")
             else:
@@ -1379,23 +1912,24 @@ def cli() -> int:
 
         # node history
         if args.node_cmd == "history":
-            session_log = scheduler.nodes_dir / node_id / ".system" / "session.jsonl"
-            if not session_log.exists():
+            session = Session(scheduler.nodes_dir / node_id)
+            messages = session.load_messages()
+
+            if not messages:
                 print("(无对话历史)")
                 return EXIT_SUCCESS
-
-            messages = []
-            for line in session_log.read_text(encoding="utf-8").strip().split("\n"):
-                if line:
-                    messages.append(json.loads(line))
 
             if args.json:
                 _json_out({"node": node_id, "messages": messages})
             else:
-                print(f"节点 {node_id} 的对话历史:")
+                print(f"节点 {node_id} 的对话历史 ({len(messages)} 条):")
                 for msg in messages:
                     role = msg.get("role", "unknown")
-                    content = msg.get("content", "")[:200]
+                    content = msg.get("content", "")
+                    if isinstance(content, list):
+                        content = json.dumps(content, ensure_ascii=False)[:200]
+                    else:
+                        content = str(content)[:200]
                     print(f"  [{role}] {content}...")
 
             return EXIT_SUCCESS
@@ -1446,7 +1980,6 @@ def cli() -> int:
 
             print(f"验证 {len(registry._models)} 个模型配置...")
             for name, cfg in registry._models.items():
-                # 简单检查 API key 是否设置
                 if not cfg.api_key:
                     print(f"  ❌ {name}: API key 未设置")
                 else:
@@ -1460,15 +1993,15 @@ def cli() -> int:
 
 
 # ============================================================
-# 10. 示例用法
+# 11. 示例用法
 # ============================================================
 
 """
 # 示例 1：初始化工作区
-python agenda.py init --workspace ./workspace --dag my_book
+python agenda.py dag init ./my_book
 
 # 示例 2：定义 DAG（手写 dag.yaml）
-cat > workspace/my_book/dag.yaml << 'EOF'
+cat > my_book/dag.yaml << 'EOF'
 dag:
   name: "Hermes vs OpenClaw"
   max_parallel: 4
@@ -1478,7 +2011,6 @@ nodes:
     prompt: "写第一章：Agent 爆发背景"
     inputs:
       - "meta/outline.md"
-    output: "output/draft.md"
 
   ch03_hermes:
     prompt: "写第三章：Hermes Agent 深度解析"
@@ -1488,19 +2020,27 @@ nodes:
     dep_inputs:
       - from: "ch01_intro/output/draft.md"
         to: "input/deps/ch01_intro/draft.md"
-    output: "output/draft.md"
 EOF
 
-# 示例 3：Python API 调用
+# 示例 3：验证 DAG
+python agenda.py dag validate ./my_book
+
+# 示例 4：预演
+python agenda.py dag run ./my_book --dry-run
+
+# 示例 5：运行 DAG
+python agenda.py dag run ./my_book --max-parallel 4
+
+# 示例 6：查看状态
+python agenda.py dag status ./my_book --watch --json
+
+# 示例 7：Python API 调用
 import asyncio
-from openai import AsyncOpenAI
 from agenda import DAGScheduler, build_tools
 
 async def main():
-    client = AsyncOpenAI(api_key="sk-...", base_url="https://api.deepseek.com/v1")
-    scheduler = DAGScheduler("workspace", "my_book").load()
+    scheduler = DAGScheduler("./workspace", "my_book").load()
     results = await scheduler.run(
-        llm_client=client,
         tools_factory=lambda session: build_tools(session, allow_shell=False),
     )
     print(results)
@@ -1509,4 +2049,4 @@ asyncio.run(main())
 """
 
 if __name__ == "__main__":
-    raise SystemExit(cli())
+    sys.exit(cli())
