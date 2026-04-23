@@ -206,7 +206,7 @@ class DAGScheduler:
                 shutil.copy(src, dst)
 
         # 3. 恢复历史（如果之前有中断）
-        loaded = session.load_messages()
+        loaded = session.replay_history()
         if loaded:
             print(f"  [节点 {node_id}] 恢复 {len(loaded)} 条历史消息")
 

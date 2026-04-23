@@ -78,7 +78,7 @@ def cli() -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Agenda — 给 Agent 调度 Agent 的极简运行时 v0.0.4",
+        description="Agenda — 给 Agent 调度 Agent 的极简运行时 v0.0.5",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 环境变量:
@@ -166,6 +166,22 @@ def cli() -> int:
     node_history.add_argument("path", nargs="?", help="DAG 文件路径（默认 AGENDA_DAG）")
     node_history.add_argument("--node", required=True, help="节点 ID")
     node_history.add_argument("--json", action="store_true", help="JSON 输出")
+
+    # ============================================================
+    # daemon 命令组
+    # ============================================================
+    daemon_parser = subparsers.add_parser("daemon", help="Daemon 管理")
+    daemon_sub = daemon_parser.add_subparsers(dest="daemon_cmd", help="Daemon 子命令")
+
+    daemon_start = daemon_sub.add_parser("start", help="启动后台 daemon")
+    daemon_start.add_argument("path", nargs="?", help="DAG 目录路径（默认当前目录）")
+    daemon_start.add_argument("--foreground", action="store_true", help="前台运行")
+
+    daemon_stop = daemon_sub.add_parser("stop", help="停止 daemon")
+    daemon_stop.add_argument("path", nargs="?", help="DAG 目录路径（默认当前目录）")
+
+    daemon_status = daemon_sub.add_parser("status", help="查看 daemon 状态")
+    daemon_status.add_argument("path", nargs="?", help="DAG 目录路径（默认当前目录）")
 
     # ============================================================
     # models 命令组
@@ -528,26 +544,50 @@ def cli() -> int:
         # node history
         if args.node_cmd == "history":
             session = Session(scheduler.nodes_dir / node_id)
-            messages = session.load_messages()
+            turns = session.load_turns()
 
-            if not messages:
+            if not turns:
                 print("(无对话历史)")
                 return EXIT_SUCCESS
 
             if args.json:
-                _json_out({"node": node_id, "messages": messages})
+                _json_out({"node": node_id, "turns": turns})
             else:
-                print(f"节点 {node_id} 的对话历史 ({len(messages)} 条):")
-                for msg in messages:
-                    role = msg.get("role", "unknown")
-                    content = msg.get("content", "")
-                    if isinstance(content, list):
-                        content = json.dumps(content, ensure_ascii=False)[:200]
-                    else:
-                        content = str(content)[:200]
-                    print(f"  [{role}] {content}...")
+                print(f"节点 {node_id} 的对话历史 ({len(turns)} 个 turn):")
+                for i, turn in enumerate(turns):
+                    msg_count = len(turn.get("messages", []))
+                    interrupted = " [已中断]" if turn.get("interrupted") else ""
+                    compact = " [记忆压缩]" if turn.get("compact") else ""
+                    print(f"  Turn {i+1}: {msg_count} 条消息{interrupted}{compact}")
 
             return EXIT_SUCCESS
+
+    # ============================================================
+    # daemon 子命令处理
+    # ============================================================
+    if args.cmd == "daemon":
+        if not args.daemon_cmd:
+            daemon_parser.print_help()
+            return EXIT_SUCCESS
+
+        from .daemon import _start_foreground, _start_daemon, _cmd_stop, _cmd_status
+
+        dag_path = _resolve_dag_path(args.path) if hasattr(args, 'path') and args.path else Path(os.environ.get("AGENDA_DAG", "."))
+        if dag_path.is_file():
+            dag_dir = dag_path.parent
+        else:
+            dag_dir = dag_path
+
+        if args.daemon_cmd == "start":
+            if args.foreground:
+                return _start_foreground(dag_dir, dag_dir / "dag.yaml")
+            return _start_daemon(dag_dir, dag_dir / "dag.yaml")
+
+        if args.daemon_cmd == "stop":
+            return _cmd_stop(dag_dir)
+
+        if args.daemon_cmd == "status":
+            return _cmd_status(dag_dir)
 
     # ============================================================
     # models 子命令处理

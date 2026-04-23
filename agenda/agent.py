@@ -1,6 +1,15 @@
 from __future__ import annotations
 
-"""Agent Loop — 核心循环（加固版）。"""
+"""Agent Loop — 核心循环（加固版）。
+
+学 Butterfly + EVA 的加固措施：
+- max_iterations: 防止无限循环（默认 50）
+- timeout: 节点级超时（默认 600s）
+- turn 级别持久化（每轮后 save_turn，取消时 save_partial_turn）
+- IPC 事件轮询（每轮前检查 events.jsonl，支持外部中断/消息）
+- 取消时补全 pending tool_calls（防止下次运行 400）
+- AI 自驱动记忆压缩
+"""
 
 import asyncio
 import json
@@ -23,12 +32,15 @@ class AgentLoop:
     Agent 的核心循环：
         prompt → LLM → (tool_call → execute → loop) → completion
 
-    加固措施（学 Butterfly + EVA）：
-    - max_iterations: 防止无限循环（默认 50）
-    - timeout: 节点级超时（默认 600s）
-    - 每轮后 save_message() 持久化（Butterfly 的 per-commit）
-    - 取消时补全 pending tool_calls（防止下次运行 400）
-    - AI 自驱动记忆压缩
+    事件流：
+        1. 恢复历史（turns.jsonl replay）
+        2. while 迭代:
+           a. 检查 IPC 事件（interrupt / message）
+           b. 记忆压缩检查
+           c. 调用 LLM
+           d. 如果有 tool_calls，执行 tools
+           e. 一轮结束 save_turn
+        3. 返回最终产物
     """
 
     def __init__(
@@ -52,19 +64,32 @@ class AgentLoop:
         self.timeout = timeout
         self._client: Any | None = None
         self._cancelled = False
+        self._events_offset: int = 0
 
     async def run(self, system_prompt: str, task: str) -> str:
-        """运行 Agent，返回最终产物。支持超时和取消。"""
-        self.messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": task},
-        ]
-        # 持久化初始消息
-        for msg in self.messages:
-            self.session.save_message(msg)
+        """运行 Agent，返回最终产物。支持超时、取消、IPC。"""
+        # 1. 恢复历史
+        loaded = self.session.replay_history()
+        if loaded:
+            # 保留 system prompt（可能和上次不同），其余从 turns 恢复
+            self.messages = [{"role": "system", "content": system_prompt}]
+            # 跳过已恢复消息中的 system
+            for msg in loaded:
+                if msg.get("role") != "system":
+                    self.messages.append(msg)
+            print(f"  [恢复] 从 turns.jsonl 加载 {len(loaded)} 条历史消息")
+        else:
+            self.messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": task},
+            ]
+
+        # 初始化 IPC offset
+        self._events_offset = self.session.events_size()
 
         start_time = time.monotonic()
         iteration = 0
+        turn_start_idx = len(self.messages)  # 本轮起始位置
 
         try:
             while iteration < self.max_iterations:
@@ -78,20 +103,29 @@ class AgentLoop:
                 if self._cancelled:
                     raise asyncio.CancelledError("Agent 被取消")
 
+                # IPC 事件轮询（学 Butterfly 的 poll_inputs）
+                await self._poll_events()
+
                 # 记忆压缩检查
                 if self._estimate_tokens() > self.token_cap * 0.75:
                     await self._compact_memory()
+                    turn_start_idx = len(self.messages)
 
                 # 调用 LLM
                 response = await self._call_llm()
                 msg = response["choices"][0]["message"]
                 msg_dict = self._msg_to_dict(msg)
                 self.messages.append(msg_dict)
-                self.session.save_message(msg_dict)
-                self.session.log_message({"type": "llm_response", "iteration": iteration, "ts": datetime.now().isoformat()})
 
                 # 完成信号
                 if not msg_dict.get("tool_calls"):
+                    # 一轮完整结束，save_turn
+                    self.session.save_turn({
+                        "type": "turn",
+                        "messages": self.messages[turn_start_idx:],
+                        "iteration": iteration,
+                        "ts": datetime.now().isoformat(),
+                    })
                     result = msg_dict.get("content", "")
                     await self.hooks.fire("on_complete", self)
                     return result
@@ -107,15 +141,24 @@ class AgentLoop:
                         "content": str(result)[:4000],
                     }
                     self.messages.append(tool_result)
-                    self.session.save_message(tool_result)
                     await self.hooks.fire("after_tool", self)
+
+                # 发送 progress 事件到 IPC（让外部观察者知道进度）
+                self.session.append_event({
+                    "type": "progress",
+                    "iteration": iteration,
+                    "tool": pending_tool_calls[-1]["function"]["name"] if pending_tool_calls else None,
+                })
 
             # 迭代次数超限
             raise RuntimeError(f"Agent 迭代次数达到上限 {self.max_iterations}")
 
         except asyncio.CancelledError:
-            # Butterfly 式 orphan 修复：补全 pending tool_calls
+            # Butterfly 式修复：保存 partial turn + 补全 orphan tool_calls
             self._seal_orphan_tool_calls()
+            committed = self.messages[turn_start_idx:]
+            if committed:
+                self.session.save_partial_turn(committed, iteration, interrupted=True)
             await self.hooks.fire("on_error", self)
             raise
         except Exception as e:
@@ -126,6 +169,26 @@ class AgentLoop:
     def cancel(self) -> None:
         """标记取消（由外部调度器调用）。"""
         self._cancelled = True
+
+    # --- IPC 事件轮询 ---
+
+    async def _poll_events(self) -> None:
+        """检查 events.jsonl 中的新事件。"""
+        events, self._events_offset = self.session.poll_events(self._events_offset)
+        for event in events:
+            etype = event.get("type")
+            if etype == "interrupt":
+                source = event.get("from", "unknown")
+                print(f"  [IPC] 收到来自 {source} 的中断信号")
+                self._cancelled = True
+            elif etype == "message":
+                source = event.get("from", "unknown")
+                content = event.get("content", "")
+                print(f"  [IPC] 收到来自 {source} 的消息")
+                self.messages.append({
+                    "role": "user",
+                    "content": f"[{source}] {content}",
+                })
 
     # --- 内部方法 ---
 
@@ -143,10 +206,42 @@ class AgentLoop:
         return self._client
 
     async def _call_llm(self) -> dict:
-        """调用 LLM API。"""
-        client = self._ensure_client()
+        """调用 LLM API。支持 fallback 模型。"""
+        cfg = self.model_cfg
+        try:
+            return await self._call_llm_with_cfg(cfg)
+        except Exception as primary_exc:
+            # 只有网络/服务端错误才 fallback，代码错误直接抛
+            if not self._is_fallbackable_error(primary_exc):
+                raise
+            fb_model = cfg.fallback_model
+            if not fb_model:
+                raise
+            print(f"  [Fallback] 主模型失败 ({type(primary_exc).__name__})，切换备用模型: {fb_model}")
+            fb_cfg = self.model_registry.get(fb_model)
+            return await self._call_llm_with_cfg(fb_cfg)
+
+    def _is_fallbackable_error(self, exc: Exception) -> bool:
+        """判断错误是否可 fallback（网络/服务端错误）。"""
+        import openai
+        if isinstance(exc, (
+            openai.APIConnectionError,
+            openai.APITimeoutError,
+            openai.InternalServerError,
+            openai.RateLimitError,
+        )):
+            return True
+        # OSError 包含连接错误
+        if isinstance(exc, OSError):
+            return True
+        return False
+
+    async def _call_llm_with_cfg(self, cfg: Any) -> dict:
+        """用指定配置调用 LLM。"""
+        from openai import AsyncOpenAI
+        client = AsyncOpenAI(base_url=cfg.base_url, api_key=cfg.api_key)
         kwargs = {
-            "model": self.model_cfg.model,
+            "model": cfg.model,
             "messages": self.messages,
             "temperature": 0.6,
         }
@@ -178,7 +273,7 @@ class AgentLoop:
     def _seal_orphan_tool_calls(self) -> None:
         """
         Butterfly 式修复：取消时，如果 messages 末尾有未完成的 tool_use，
-        补全 synthetic tool_result，防止下次运行 LLM 返回 400（orphan tool_use）。
+        补全 synthetic tool_result，防止下次运行 LLM 返回 400。
         """
         if not self.messages:
             return
@@ -187,7 +282,6 @@ class AgentLoop:
             return
         for tc in last["tool_calls"]:
             tc_id = tc.get("id", "")
-            # 检查是否已有对应的 tool_result
             has_result = any(
                 m.get("role") == "tool" and m.get("tool_call_id") == tc_id
                 for m in self.messages
@@ -199,7 +293,6 @@ class AgentLoop:
                     "content": "[系统] 工具调用因任务中断而被取消。",
                 }
                 self.messages.append(synthetic)
-                self.session.save_message(synthetic)
 
     async def _compact_memory(self) -> None:
         """AI 自驱动记忆压缩（从 EVA 移植）。"""
@@ -216,14 +309,12 @@ class AgentLoop:
 不要请求用户确认，直接执行。"""
 
         self.messages.append({"role": "user", "content": compact_prompt})
-        self.session.save_message({"role": "user", "content": compact_prompt})
 
         for _ in range(3):
             response = await self._call_llm()
             msg = response["choices"][0]["message"]
             msg_dict = self._msg_to_dict(msg)
             self.messages.append(msg_dict)
-            self.session.save_message(msg_dict)
 
             if not msg_dict.get("tool_calls"):
                 break
@@ -236,14 +327,18 @@ class AgentLoop:
                     "content": str(result)[:4000],
                 }
                 self.messages.append(tr)
-                self.session.save_message(tr)
 
         # 压缩后截断：保留 system + 最近 4 轮
         self.messages = [self.messages[0]] + self.messages[-4:]
-        # 重新持久化截断后的历史（覆盖式，因为 JSONL 不支持中间删除）
-        self.session.clear_messages()
-        for msg in self.messages:
-            self.session.save_message(msg)
+        # 重新持久化截断后的历史
+        self.session.clear_turns()
+        turn = {
+            "type": "turn",
+            "messages": list(self.messages),
+            "compact": True,
+            "ts": datetime.now().isoformat(),
+        }
+        self.session.save_turn(turn)
         print("  [记忆压缩完成]")
 
     def _estimate_tokens(self) -> int:
@@ -263,4 +358,3 @@ class AgentLoop:
         if hasattr(msg, "tool_calls") and msg.tool_calls:
             d["tool_calls"] = [tc.model_dump() for tc in msg.tool_calls]
         return d
-

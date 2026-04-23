@@ -1,6 +1,15 @@
 from __future__ import annotations
 
-"""子 Agent 系统（简化版 Butterfly sub_agent）。"""
+"""子 Agent 系统（简化版 Butterfly sub_agent）。
+
+改进（v0.0.5）：
+- 用 IPC（events.jsonl）替代 done.json 轮询
+- 支持实时 progress 事件
+- 支持取消级联（父向子的 events.jsonl 写 interrupt）
+- 支持父子消息传递
+
+最大嵌套深度：MAX_SUB_AGENT_DEPTH（默认 2）
+"""
 
 import asyncio
 import json
@@ -23,12 +32,11 @@ class SubAgentManager:
     """
     子 Agent 管理器。
 
-    设计：不实现 Butterfly 的完整 BridgeSession，而是用文件系统状态机：
-    - 父 Agent 调用 spawn_child → 创建子 session + 启动子 Agent 任务
-    - 子 Agent 运行完成后写 output/done.json
-    - 父 Agent 轮询 wait_for_child 读取结果
-
-    最大嵌套深度：MAX_SUB_AGENT_DEPTH（默认 2）
+    通信机制（文件系统 IPC）：
+    - 子 Agent 运行中向自己的 events.jsonl 写 progress 事件
+    - 子 Agent 完成后向 events.jsonl 写 completed/failed 事件
+    - 父 Agent 轮询子 Agent 的 events.jsonl 获取结果
+    - 父 Agent 取消时向子 Agent 的 events.jsonl 写 interrupt 事件
     """
 
     def __init__(self, parent_session: Session, model_registry: ModelRegistry,
@@ -42,7 +50,6 @@ class SubAgentManager:
         """计算当前嵌套深度。"""
         depth = 0
         node_dir = self.parent_session.node_dir
-        # 向上追溯 children/ 目录层数
         while node_dir.name == "children" or (node_dir.parent and node_dir.parent.name == "children"):
             depth += 1
             node_dir = node_dir.parent.parent if node_dir.parent else node_dir
@@ -63,24 +70,24 @@ class SubAgentManager:
             return f"[错误] 子 Agent 嵌套深度已达上限 {self.max_depth}"
 
         child_session = self.parent_session.child_session(name)
-        # 如果已存在且已完成，拒绝覆盖
-        if child_session.is_done("done.json"):
-            return f"[错误] 子 Agent '{name}' 已存在且已完成"
 
         # 准备子 Agent 的 system prompt
         child_system = system_prompt or f"""你是一个子 Agent，被父 Agent 委派执行特定任务。
 
 # 规则
 - 你是独立的 Agent，有自己的 .context/ 和 output/
-- 完成任务后，必须写入 output/draft.md 和 output/done.json
-- done.json 格式: {{"status": "completed", "summary": "任务摘要"}}
-- 如果失败，写入 output/done.json: {{"status": "failed", "error": "错误信息"}}
+- 完成任务后，向自己的 events.jsonl 发送 completed 事件
+- 运行中可发送 progress 事件让父 Agent 知道进度
+- 收到 interrupt 事件时应优雅停止
+
+# 可用工具
+和父 Agent 相同的文件系统工具 + IPC 工具
 
 # 记忆线索
 当前嵌套深度: {current_depth + 1}/{self.max_depth}
+父 Agent 可通过 events.jsonl 与你通信
 """
 
-        # 创建子 Agent 的工具集
         child_tools = build_tools(child_session, allow_shell=False)
         child_hooks = HookRegistry()
 
@@ -96,20 +103,25 @@ class SubAgentManager:
             )
             try:
                 result = await agent.run(child_system, task)
-                # 写完成标记
-                child_session.write_output("done.json", json.dumps({
-                    "status": "completed",
-                    "summary": result[:500] if result else "",
+                child_session.append_event({
+                    "type": "completed",
+                    "result": result,
                     "finished_at": datetime.now().isoformat(),
-                }, ensure_ascii=False))
+                })
                 if not child_session.output_exists:
                     child_session.write_output("draft.md", result)
+            except asyncio.CancelledError:
+                child_session.append_event({
+                    "type": "cancelled",
+                    "finished_at": datetime.now().isoformat(),
+                })
+                raise
             except Exception as e:
-                child_session.write_output("done.json", json.dumps({
-                    "status": "failed",
+                child_session.append_event({
+                    "type": "failed",
                     "error": f"{type(e).__name__}: {e}",
                     "finished_at": datetime.now().isoformat(),
-                }, ensure_ascii=False))
+                })
                 child_session.write_system("error.log", traceback.format_exc())
 
         task_obj = asyncio.create_task(_run_child(), name=f"subagent_{name}")
@@ -117,23 +129,26 @@ class SubAgentManager:
         return f"[系统] 子 Agent '{name}' 已启动（深度: {current_depth + 1}/{self.max_depth}）"
 
     async def wait_for_child(self, name: str, poll_interval: float = 1.0, timeout: float = 300.0) -> str:
-        """轮询等待子 Agent 完成。返回结果摘要。"""
+        """轮询子 Agent 的 events.jsonl 等待完成。返回结果。"""
         child_session = self.parent_session.child_session(name)
         deadline = time.monotonic() + timeout
-        done_path = child_session.output_dir / "done.json"
+        offset = child_session.events_size()
 
         while time.monotonic() < deadline:
-            if done_path.exists():
-                try:
-                    done = json.loads(done_path.read_text(encoding="utf-8"))
-                    status = done.get("status", "unknown")
-                    if status == "completed":
-                        draft = child_session.read_context("output/draft.md")
-                        return f"[子 Agent '{name}' 完成]\n{draft[:2000]}"
-                    else:
-                        return f"[子 Agent '{name}' 失败] {done.get('error', '未知错误')}"
-                except Exception as e:
-                    return f"[错误] 读取子 Agent '{name}' 结果失败: {e}"
+            events, offset = child_session.poll_events(offset)
+            for event in events:
+                etype = event.get("type")
+                if etype == "completed":
+                    result = event.get("result", "")
+                    return f"[子 Agent '{name}' 完成]\n{result[:2000]}"
+                elif etype == "failed":
+                    error = event.get("error", "未知错误")
+                    return f"[子 Agent '{name}' 失败] {error}"
+                elif etype == "cancelled":
+                    return f"[子 Agent '{name}' 已取消]"
+                elif etype == "progress":
+                    print(f"  [子 Agent '{name}' 进度] 迭代 {event.get('iteration')}")
+
             await asyncio.sleep(poll_interval)
 
         return f"[超时] 等待子 Agent '{name}' 超过 {timeout} 秒"
@@ -145,10 +160,18 @@ class SubAgentManager:
         return [d.name for d in self.parent_session.children_dir.iterdir() if d.is_dir()]
 
     def kill_child(self, name: str) -> str:
-        """取消子 Agent 任务。"""
+        """向子 Agent 发送中断信号。"""
+        child_session = self.parent_session.child_session(name)
+        child_session.send_interrupt(source="parent")
+
         task = self._child_tasks.get(name)
         if task and not task.done():
             task.cancel()
-            return f"[系统] 子 Agent '{name}' 已取消"
-        return f"[系统] 子 Agent '{name}' 未运行"
+            return f"[系统] 子 Agent '{name}' 已发送中断信号并取消任务"
+        return f"[系统] 子 Agent '{name}' 未运行，但已发送中断信号"
 
+    async def send_message_to_child(self, name: str, content: str) -> str:
+        """向子 Agent 发送消息。"""
+        child_session = self.parent_session.child_session(name)
+        child_session.send_message(content, source="parent")
+        return f"[系统] 已向子 Agent '{name}' 发送消息"

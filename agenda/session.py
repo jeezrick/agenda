@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-"""Session — 双目录隔离 + 持久化。"""
+"""Session — 双目录隔离 + Turn 持久化 + IPC。
+
+学 Butterfly 的关键设计：
+- turns.jsonl: turn 级别持久化（每轮 LLM 运行打包保存）
+- events.jsonl: IPC 事件队列（其他 Agent 可写入消息/中断）
+- 取消时 save_partial_turn，不丢失已 committed 的中间结果
+"""
 
 import json
 import os
@@ -18,13 +24,12 @@ class Session:
         nodes/{node_id}/
             .context/     ← Agent 可见（读/写）
             .system/      ← 系统私有（Agent 不可见）
+                turns.jsonl     ← 对话历史（turn 级别，append-only）
+                events.jsonl    ← IPC 事件队列（其他 Agent 可写入）
+                state.json      ← 运行状态
+                session.jsonl   ← 运行时日志
             output/       ← Agent 产物
-            children/     ← 子 Agent 的 session（Agent 不可见）
-
-    持久化（学 Butterfly 的 append-only JSONL）：
-        .system/messages.jsonl  ← 对话历史（append-only，每轮后 flush）
-        .system/state.json      ← 运行状态（running/completed/failed）
-        .system/session.jsonl   ← 运行时事件日志
+            children/     ← 子 Agent 的 session
     """
 
     def __init__(self, node_dir: Path) -> None:
@@ -34,15 +39,15 @@ class Session:
         self.output_dir = self.node_dir / "output"
         self.children_dir = self.node_dir / "children"
 
-        # 自动创建目录
         self.context_dir.mkdir(parents=True, exist_ok=True)
         self.system_dir.mkdir(parents=True, exist_ok=True)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.children_dir.mkdir(parents=True, exist_ok=True)
 
         # 文件路径
-        self._messages_path = self.system_dir / "messages.jsonl"
-        self._events_path = self.system_dir / "session.jsonl"
+        self._turns_path = self.system_dir / "turns.jsonl"
+        self._events_path = self.system_dir / "events.jsonl"
+        self._session_log_path = self.system_dir / "session.jsonl"
         self._state_path = self.system_dir / "state.json"
 
     # --- Agent 可见操作 ---
@@ -73,11 +78,6 @@ class Session:
         return "\n".join(lines) or "(空)"
 
     # --- 系统私有操作 ---
-
-    def log_message(self, message: dict) -> None:
-        """追加消息到 .system/session.jsonl（append-only 运行时日志）。"""
-        with open(self._events_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(message, ensure_ascii=False) + "\n")
 
     def write_system(self, rel_path: str, content: str) -> None:
         """系统写入 .system/ 目录（Agent 不可见）。"""
@@ -112,33 +112,106 @@ class Session:
         except (json.JSONDecodeError, OSError):
             return default
 
-    # --- 持久化：messages.jsonl（学 Butterfly 的 context.jsonl） ---
+    # --- Turn 级别持久化（学 Butterfly 的 context.jsonl turn 事件） ---
 
-    def save_message(self, message: dict) -> None:
-        """追加单条消息到 messages.jsonl。"""
-        with open(self._messages_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(message, ensure_ascii=False) + "\n")
+    def save_turn(self, turn: dict) -> None:
+        """追加一个 turn 到 turns.jsonl。
 
-    def load_messages(self) -> list[dict]:
-        """从 messages.jsonl 恢复对话历史。"""
-        messages: list[dict] = []
-        if not self._messages_path.exists():
-            return messages
-        with open(self._messages_path, "r", encoding="utf-8") as f:
+        turn 格式: {"type": "turn", "messages": [...], "usage": {...}, "ts": "..."}
+        """
+        with open(self._turns_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(turn, ensure_ascii=False) + "\n")
+
+    def save_partial_turn(self, messages: list[dict], iteration: int, interrupted: bool = True) -> None:
+        """取消时保存已 committed 的部分 turn（Butterfly v2.0.34 式修复）。"""
+        turn = {
+            "type": "turn",
+            "messages": list(messages),
+            "iteration": iteration,
+            "interrupted": interrupted,
+            "ts": datetime.now().isoformat(),
+        }
+        self.save_turn(turn)
+
+    def load_turns(self) -> list[dict]:
+        """从 turns.jsonl 恢复所有 turn。"""
+        turns: list[dict] = []
+        if not self._turns_path.exists():
+            return turns
+        with open(self._turns_path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 try:
-                    messages.append(json.loads(line))
+                    turns.append(json.loads(line))
                 except json.JSONDecodeError:
                     pass
+        return turns
+
+    def replay_history(self) -> list[dict]:
+        """从 turns.jsonl replay 成 flat messages 列表（用于恢复 AgentLoop）。"""
+        messages: list[dict] = []
+        for turn in self.load_turns():
+            for msg in turn.get("messages", []):
+                messages.append(msg)
         return messages
 
-    def clear_messages(self) -> None:
-        """清空 messages.jsonl（重置节点时调用）。"""
-        if self._messages_path.exists():
-            self._messages_path.unlink()
+    def clear_turns(self) -> None:
+        """清空 turns.jsonl（重置节点时调用）。"""
+        if self._turns_path.exists():
+            self._turns_path.unlink()
+
+    # --- IPC: events.jsonl（进程间通信） ---
+
+    def append_event(self, event: dict) -> None:
+        """向 events.jsonl 追加事件。其他进程/Agent 可读。"""
+        event.setdefault("ts", datetime.now().isoformat())
+        with open(self._events_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def poll_events(self, offset: int = 0) -> tuple[list[dict], int]:
+        """从 offset（字节偏移）开始读取新事件。
+
+        Returns: (events, new_offset)
+        """
+        if not self._events_path.exists():
+            return [], 0
+        events: list[dict] = []
+        with open(self._events_path, "r", encoding="utf-8") as f:
+            f.seek(offset)
+            data = f.read()
+            new_offset = f.tell()
+        for line in data.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+        return events, new_offset
+
+    def events_size(self) -> int:
+        """当前 events.jsonl 的字节大小（用于初始化 offset）。"""
+        if not self._events_path.exists():
+            return 0
+        return self._events_path.stat().st_size
+
+    def send_interrupt(self, source: str = "scheduler") -> None:
+        """向该 session 发送中断信号。"""
+        self.append_event({"type": "interrupt", "from": source})
+
+    def send_message(self, content: str, source: str) -> None:
+        """向该 session 发送消息（模拟用户输入）。"""
+        self.append_event({"type": "message", "from": source, "content": content})
+
+    # --- 运行时日志（保留向后兼容） ---
+
+    def log_message(self, message: dict) -> None:
+        """追加消息到 .system/session.jsonl（append-only 运行时日志）。"""
+        with open(self._session_log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(message, ensure_ascii=False) + "\n")
 
     # --- 内部工具 ---
 
@@ -175,4 +248,3 @@ class Session:
         """获取/创建子 Agent 的 session。"""
         child_dir = self.children_dir / name
         return Session(child_dir)
-

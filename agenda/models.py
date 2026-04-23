@@ -30,6 +30,8 @@ class ModelConfig:
     model: str               # 实际模型名，如 "deepseek-chat"
     token_cap: int = 32000   # 上下文窗口上限
     provider: str = "openai" # 预留：未来支持非 OpenAI 接口
+    fallback_model: str | None = None   # 备用模型名（主模型失败时切换）
+    fallback_provider: str | None = None # 备用 provider
 
 
 class ModelRegistry:
@@ -79,6 +81,8 @@ class ModelRegistry:
                 model=self._resolve_value(cfg.get("model", "")),
                 token_cap=int(cfg.get("token_cap", 32000)),
                 provider=cfg.get("provider", "openai"),
+                fallback_model=cfg.get("fallback_model"),
+                fallback_provider=cfg.get("fallback_provider"),
             )
 
     def _resolve_value(self, value: str) -> str:

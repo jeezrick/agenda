@@ -12,7 +12,7 @@
 依赖：标准库 + pyyaml + openai
 """
 
-__version__ = "0.0.4"
+__version__ = "0.0.5"
 
 from .const import (
     EXIT_SUCCESS,
@@ -29,6 +29,7 @@ from .agent import AgentLoop
 from .subagent import SubAgentManager
 from .scheduler import DAGScheduler
 from .security import SecurityReviewer
+from .daemon import NodeWatcher
 from .cli import cli
 
 __all__ = [
@@ -47,5 +48,6 @@ __all__ = [
     "SubAgentManager",
     "DAGScheduler",
     "SecurityReviewer",
+    "NodeWatcher",
     "cli",
 ]
