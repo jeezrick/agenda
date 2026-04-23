@@ -12,7 +12,7 @@
 依赖：标准库 + pyyaml + openai
 """
 
-__version__ = "0.0.5"
+__version__ = "0.0.6"
 
 from .const import (
     EXIT_SUCCESS,
@@ -22,6 +22,7 @@ from .const import (
     EXIT_DEPENDENCY_ERROR,
 )
 from .models import ModelConfig, ModelRegistry
+from .guardian import Guardian
 from .session import Session
 from .hooks import HookRegistry
 from .tools import ToolRegistry, build_tools
@@ -40,6 +41,7 @@ __all__ = [
     "EXIT_DEPENDENCY_ERROR",
     "ModelConfig",
     "ModelRegistry",
+    "Guardian",
     "Session",
     "HookRegistry",
     "ToolRegistry",

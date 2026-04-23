@@ -83,9 +83,7 @@ def build_tools(session: Session, allow_shell: bool = False, llm_client: Any | N
 
     @tools.register("write_file")
     def write_file(path: str, content: str) -> str:
-        """写入 output/ 目录。路径必须以 output/ 开头。"""
-        if not path.startswith("output/"):
-            return "[错误] 只能写入 output/ 目录"
+        """写入 output/ 目录。"""
         return session.write_output(path, content)
 
     @tools.register("list_dir")
@@ -125,7 +123,7 @@ def build_tools(session: Session, allow_shell: bool = False, llm_client: Any | N
                     capture_output=True,
                     text=True,
                     timeout=timeout,
-                    cwd=str(session.context_dir),
+                    cwd=str(session.node_dir),
                 )
                 output = result.stdout or ""
                 if result.stderr:

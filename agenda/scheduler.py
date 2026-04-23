@@ -258,6 +258,30 @@ class DAGScheduler:
                 else:
                     self.failed.add(n)
 
+        # 崩溃后 running 状态无效，需要重新分类
+        for n in list(self.running):
+            if n in self.completed or n in self.failed:
+                self.running.discard(n)
+                continue
+            if self.node_is_done(n):
+                self.completed.add(n)
+                self.running.discard(n)
+            elif self.node_is_failed(n):
+                retries = self.retries.get(n, 0)
+                max_retry = self.dag["nodes"][n].get("retries", DEFAULT_MAX_RETRIES)
+                if retries < max_retry:
+                    print(f"[DAG] 节点 {n} 上次运行失败，将重试 ({retries + 1}/{max_retry})")
+                    error_log = self.nodes_dir / n / ".system" / "error.log"
+                    if error_log.exists():
+                        error_log.unlink()
+                    self.running.discard(n)
+                else:
+                    self.failed.add(n)
+                    self.running.discard(n)
+            else:
+                # 既没有完成也没有失败，被中断了，重置为 pending
+                self.running.discard(n)
+
         print(f"[DAG] 总节点: {len(node_ids)}, 已完成: {len(self.completed)}, 失败: {len(self.failed)}")
 
         pending_tasks: dict[str, asyncio.Task] = {}

@@ -15,6 +15,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .guardian import Guardian
+
 
 class Session:
     """
@@ -44,6 +46,9 @@ class Session:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.children_dir.mkdir(parents=True, exist_ok=True)
 
+        # Guardian 硬边界（root = node_dir）
+        self.guardian = Guardian(self.node_dir)
+
         # 文件路径
         self._turns_path = self.system_dir / "turns.jsonl"
         self._events_path = self.system_dir / "events.jsonl"
@@ -54,22 +59,42 @@ class Session:
 
     def read_context(self, rel_path: str) -> str:
         """Agent 读取 .context/ 或 output/ 下的文件。"""
-        target = self._resolve_safe(rel_path)
-        if not target or not target.exists():
+        try:
+            target = self.guardian.check_read(rel_path)
+        except PermissionError as e:
+            return f"[Guardian] {e}"
+        safe = self._resolve_safe(rel_path)
+        if not safe:
+            return f"[错误] 路径不允许: {rel_path}"
+        if not target.exists():
             return f"[错误] 文件不存在: {rel_path}"
         return target.read_text(encoding="utf-8")
 
     def write_output(self, rel_path: str, content: str) -> str:
         """Agent 写入 output/ 目录。"""
-        target = self.output_dir / rel_path.lstrip("/")
+        try:
+            target = self.guardian.check_write(rel_path)
+        except PermissionError as e:
+            return f"[Guardian] {e}"
+        # 语义限制：只能写入 output/
+        try:
+            target.relative_to(self.output_dir)
+        except ValueError:
+            return f"[错误] 只能写入 output/ 目录: {rel_path}"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         return f"[成功] 已写入 {rel_path}"
 
     def list_context(self, rel_path: str = ".") -> str:
         """Agent 列出 .context/ 或 output/ 下的目录。"""
-        target = self._resolve_safe(rel_path)
-        if not target or not target.exists():
+        try:
+            target = self.guardian.check_read(rel_path)
+        except PermissionError as e:
+            return f"[Guardian] {e}"
+        safe = self._resolve_safe(rel_path)
+        if not safe:
+            return f"[错误] 路径不允许: {rel_path}"
+        if not target.exists():
             return f"[错误] 目录不存在: {rel_path}"
         lines = []
         for item in sorted(target.iterdir()):
@@ -216,13 +241,16 @@ class Session:
     # --- 内部工具 ---
 
     def _resolve_safe(self, rel_path: str) -> Path | None:
-        """解析路径，确保只在 .context/ 或 output/ 内。"""
-        raw = Path(rel_path.lstrip("/"))
+        """语义检查：Agent 只能访问 .context/ 或 output/ 下的内容。
+
+        底层路径安全由 Guardian 负责（resolve + relative_to 防逃逸）。
+        这里只做语义范围限制。
+        """
+        target = self.guardian.resolve(rel_path)
         for base in (self.context_dir, self.output_dir):
-            candidate = (base / raw).resolve()
             try:
-                candidate.relative_to(base.resolve())
-                return candidate
+                target.relative_to(base)
+                return target
             except ValueError:
                 continue
         return None

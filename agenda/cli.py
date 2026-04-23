@@ -78,7 +78,7 @@ def cli() -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Agenda — 给 Agent 调度 Agent 的极简运行时 v0.0.5",
+        description="Agenda — 给 Agent 调度 Agent 的极简运行时 v0.0.6",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 环境变量:
@@ -95,7 +95,7 @@ def cli() -> int:
   130 用户中断 (Ctrl+C)
         """,
     )
-    parser.add_argument("--version", action="version", version="%(prog)s 0.0.4")
+    parser.add_argument("--version", action="version", version="%(prog)s 0.0.6")
 
     subparsers = parser.add_subparsers(dest="cmd", help="命令")
 
@@ -109,6 +109,11 @@ def cli() -> int:
     dag_init = dag_sub.add_parser("init", help="初始化 DAG 工作区")
     dag_init.add_argument("path", nargs="?", help="DAG 文件路径（默认 AGENDA_DAG）")
     dag_init.add_argument("--from-template", help="从模板初始化")
+
+    # dag create
+    dag_create = dag_sub.add_parser("create", help="从 JSON 创建 DAG YAML（Meta Agent 推荐）")
+    dag_create.add_argument("--from-json", required=True, help="JSON 文件路径，或用 '-' 从 stdin 读取")
+    dag_create.add_argument("-o", "--output", required=True, help="输出 YAML 文件路径")
 
     # dag validate
     dag_validate = dag_sub.add_parser("validate", help="验证 DAG 配置")
@@ -228,6 +233,32 @@ def cli() -> int:
                     encoding="utf-8",
                 )
             print(f"[dag init] 已初始化 DAG: {dag_path}")
+            return EXIT_SUCCESS
+
+        # dag create
+        if args.dag_cmd == "create":
+            import yaml
+            src = args.from_json
+            if src == "-":
+                json_data = sys.stdin.read()
+            else:
+                json_data = Path(src).read_text(encoding="utf-8")
+            try:
+                data = json.loads(json_data)
+            except json.JSONDecodeError as e:
+                print(f"[错误] JSON 解析失败: {e}", file=sys.stderr)
+                return EXIT_ARGS_ERROR
+            # 简单验证结构
+            if "nodes" not in data:
+                print("[错误] JSON 缺少 'nodes' 字段", file=sys.stderr)
+                return EXIT_ARGS_ERROR
+            # 确保 dag 字段存在
+            if "dag" not in data:
+                data["dag"] = {"name": "untitled", "max_parallel": 4}
+            out_path = Path(args.output)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+            print(f"[dag create] 已创建: {out_path}")
             return EXIT_SUCCESS
 
         # dag validate
