@@ -1,0 +1,19 @@
+from __future__ import annotations
+
+"""常量与默认值。"""
+
+
+EXIT_SUCCESS = 0
+EXIT_ARGS_ERROR = 1
+EXIT_DAG_CONFIG_ERROR = 2
+EXIT_EXECUTION_ERROR = 3
+EXIT_DEPENDENCY_ERROR = 4
+
+# 子 Agent 最大嵌套深度（防止无限 fork）
+MAX_SUB_AGENT_DEPTH = 2
+
+# Agent 默认安全限制
+DEFAULT_MAX_ITERATIONS = 50
+DEFAULT_NODE_TIMEOUT = 600  # 秒
+DEFAULT_MAX_RETRIES = 3
+
