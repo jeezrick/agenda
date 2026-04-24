@@ -134,7 +134,7 @@ class Session:
         return target.read_text(encoding="utf-8")
 
     def set_state(self, key: str, value: Any) -> None:
-        """读写 .system/state.json。"""
+        """读写 .system/state.json。原子写入避免损坏。"""
         state = {}
         if self._state_path.exists():
             try:
@@ -142,7 +142,9 @@ class Session:
             except (json.JSONDecodeError, OSError):
                 state = {}
         state[key] = value
-        self._state_path.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp = self._state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(self._state_path)
 
     def get_state(self, key: str, default: Any = None) -> Any:
         if not self._state_path.exists():

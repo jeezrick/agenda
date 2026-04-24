@@ -225,7 +225,6 @@ class NodeWatcher:
             await self._scheduler._run_node(
                 node_id,
                 tools_factory=lambda session: build_tools(session),
-                hooks_factory=None,
             )
         except asyncio.CancelledError:
             raise

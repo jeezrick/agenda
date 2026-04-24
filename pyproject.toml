@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "agenda"
-version = "0.0.4"
+version = "0.0.6"
 description = "给 Agent 调度 Agent 的极简 DAG 运行时"
 readme = "README.md"
 license = {text = "MIT"}

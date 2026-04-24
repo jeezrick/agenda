@@ -61,7 +61,7 @@ class AgentLoop:
         self.max_iterations = max(1, max_iterations)
         self.timeout = timeout
         self.node_id = node_id
-        self._client: Any | None = None
+        self._clients: dict[tuple, Any] = {}
         self._cancelled = False
         self._events_offset: int = 0
 
@@ -187,18 +187,16 @@ class AgentLoop:
 
     # --- 内部方法 ---
 
-    def _ensure_client(self) -> Any:
-        """根据模型配置创建 OpenAI 兼容客户端。"""
-        if self._client is not None:
-            return self._client
-        try:
-            from openai import AsyncOpenAI
-        except ImportError:
-            print("[错误] 需要安装 openai: pip install openai")
-            raise SystemExit(1)
-        cfg = self.model_cfg
-        self._client = AsyncOpenAI(base_url=cfg.base_url, api_key=cfg.api_key)
-        return self._client
+    def _get_client(self, cfg: Any) -> Any:
+        """获取或创建 OpenAI 兼容客户端（按配置缓存）。"""
+        key = (cfg.base_url, cfg.model)
+        if key not in self._clients:
+            try:
+                from openai import AsyncOpenAI
+            except ImportError as exc:
+                raise ImportError("需要安装 openai: pip install openai") from exc
+            self._clients[key] = AsyncOpenAI(base_url=cfg.base_url, api_key=cfg.api_key)
+        return self._clients[key]
 
     async def _call_llm(self) -> dict:
         """调用 LLM API。支持 fallback 模型。"""
@@ -233,8 +231,7 @@ class AgentLoop:
 
     async def _call_llm_with_cfg(self, cfg: Any) -> dict:
         """用指定配置调用 LLM。"""
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(base_url=cfg.base_url, api_key=cfg.api_key)
+        client = self._get_client(cfg)
         kwargs = {
             "model": cfg.model,
             "messages": self.messages,

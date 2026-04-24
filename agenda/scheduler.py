@@ -90,7 +90,7 @@ class DAGScheduler:
     # --- 调度状态持久化 ---
 
     def _save_scheduler_state(self) -> None:
-        """保存调度器运行状态到文件（用于中断恢复）。"""
+        """保存调度器运行状态到文件（用于中断恢复）。原子写入避免损坏。"""
         state = {
             "completed": sorted(self.completed),
             "failed": sorted(self.failed),
@@ -98,7 +98,9 @@ class DAGScheduler:
             "retries": self.retries,
             "saved_at": datetime.now().isoformat(),
         }
-        self.state_file.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp = self.state_file.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(self.state_file)
 
     def _load_scheduler_state(self) -> None:
         """从文件恢复调度器状态。"""

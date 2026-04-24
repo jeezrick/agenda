@@ -113,8 +113,10 @@ def cli() -> int:
     daemon_start.add_argument("path", nargs="?")
     daemon_start.add_argument("--foreground", action="store_true")
 
-    daemon_sub.add_parser("stop")
-    daemon_sub.add_parser("status")
+    daemon_stop = daemon_sub.add_parser("stop")
+    daemon_stop.add_argument("path", nargs="?")
+    daemon_status = daemon_sub.add_parser("status")
+    daemon_status.add_argument("path", nargs="?")
 
     models_parser = subparsers.add_parser("models", help="模型管理")
     models_sub = models_parser.add_subparsers(dest="models_cmd")
