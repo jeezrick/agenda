@@ -65,9 +65,9 @@ class Session:
             return f"[Guardian] {e}"
         safe = self._resolve_safe(rel_path)
         if not safe:
-            return f"[错误] 路径不允许: {rel_path}"
+            return self._format_path_error(rel_path)
         if not target.exists():
-            return f"[错误] 文件不存在: {rel_path}"
+            return f"[错误] 文件不存在: {rel_path}\n提示: 可用 list_dir('.context') 或 list_dir('output') 查看可用文件。"
         return target.read_text(encoding="utf-8")
 
     def write_output(self, rel_path: str, content: str) -> str:
@@ -87,15 +87,18 @@ class Session:
 
     def list_context(self, rel_path: str = ".") -> str:
         """Agent 列出 .context/ 或 output/ 下的目录。"""
+        # 对 "." 做友好映射：默认展示 .context/ 内容
+        if rel_path in (".", ""):
+            rel_path = ".context"
         try:
             target = self.guardian.check_read(rel_path)
         except PermissionError as e:
             return f"[Guardian] {e}"
         safe = self._resolve_safe(rel_path)
         if not safe:
-            return f"[错误] 路径不允许: {rel_path}"
+            return self._format_path_error(rel_path)
         if not target.exists():
-            return f"[错误] 目录不存在: {rel_path}"
+            return f"[错误] 目录不存在: {rel_path}\n提示: 可用 list_dir('.context') 或 list_dir('output') 查看可用目录。"
         lines = []
         for item in sorted(target.iterdir()):
             t = "[目录]" if item.is_dir() else "[文件]"
@@ -254,6 +257,16 @@ class Session:
             except ValueError:
                 continue
         return None
+
+    def _format_path_error(self, rel_path: str) -> str:
+        """返回友好的路径错误信息，提示 Agent 正确的路径范围。"""
+        return (
+            f"[错误] 路径不允许: {rel_path}\n"
+            f"提示: 你只能访问以下目录下的内容:\n"
+            f"  - .context/   ← 输入文件（大纲、计划、证据等）\n"
+            f"  - output/     ← 输出产物\n"
+            f"可用 list_dir('.context') 查看可用文件。"
+        )
 
     @property
     def output_exists(self) -> bool:

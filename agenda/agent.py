@@ -50,6 +50,7 @@ class AgentLoop:
         model: str | None = None,
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         timeout: float = DEFAULT_NODE_TIMEOUT,
+        node_id: str | None = None,
     ) -> None:
         self.session = session
         self.model_registry = model_registry
@@ -59,6 +60,7 @@ class AgentLoop:
         self.messages: list[dict] = []
         self.max_iterations = max(1, max_iterations)
         self.timeout = timeout
+        self.node_id = node_id
         self._client: Any | None = None
         self._cancelled = False
         self._events_offset: int = 0
@@ -140,6 +142,7 @@ class AgentLoop:
                 # 发送 progress 事件到 IPC（让外部观察者知道进度）
                 self.session.append_event({
                     "type": "progress",
+                    "node_id": self.node_id,
                     "iteration": iteration,
                     "tool": pending_tool_calls[-1]["function"]["name"] if pending_tool_calls else None,
                 })

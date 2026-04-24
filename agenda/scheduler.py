@@ -197,13 +197,9 @@ class DAGScheduler:
         for src_pattern in config.get("inputs", []):
             self._copy_input(src_pattern, session.context_dir)
 
-        # 2. 复制依赖产物
+        # 2. 复制依赖产物（支持 #section 锚点）
         for mapping in config.get("dep_inputs", []):
-            src = self.dag_dir / mapping["from"]
-            dst = session.context_dir / mapping["to"].lstrip("/")
-            if src.exists():
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy(src, dst)
+            self._copy_input(mapping["from"], session.context_dir, dst_rel=mapping["to"])
 
         # 3. 恢复历史（如果之前有中断）
         loaded = session.replay_history()
@@ -423,14 +419,20 @@ class DAGScheduler:
 # 可用工具
 你可以调用以下工具来操作文件系统：
 - read_file(path): 读取 .context/ 或 output/ 下的文件
+  例: read_file(".context/book/outline.md")
 - write_file(path, content): 写入 output/ 目录
-- list_dir(path="."): 列出目录内容
+  例: write_file("output/draft.md", "# 标题...")
+- list_dir(path): 列出 .context/ 或 output/ 下的目录内容
+  提示: list_dir(".") 等价于 list_dir(".context")，会展示输入文件
+  例: list_dir(".context")、list_dir("output")
 - spawn_child(task, name, model?): 创建子 Agent 执行子任务
 - wait_for_child(name, timeout?): 等待子 Agent 完成
 - list_children(): 列出所有子 Agent
 
-# 记忆线索
-{session.read_system("hints.md")}
+# 工作目录结构
+你的可见范围仅限以下目录：
+  .context/   ← 输入文件（大纲、计划、证据、前置章节等）
+  output/     ← 你的产出文件
 """
 
             agent = AgentLoop(
@@ -440,6 +442,7 @@ class DAGScheduler:
                 model=model_alias,
                 max_iterations=config.get("max_iterations", DEFAULT_MAX_ITERATIONS),
                 timeout=config.get("timeout", DEFAULT_NODE_TIMEOUT),
+                node_id=node_id,
             )
 
             result = await agent.run(system_prompt, config["prompt"])
@@ -466,8 +469,14 @@ class DAGScheduler:
         finally:
             self.running.discard(node_id)
 
-    def _copy_input(self, src_pattern: str, dst_dir: Path) -> None:
-        """复制 input 文件到节点 context。支持 #section 锚点。"""
+    def _copy_input(self, src_pattern: str, dst_dir: Path, dst_rel: str | None = None) -> None:
+        """复制 input 文件到节点 context。支持 #section 锚点。
+
+        Args:
+            src_pattern: 源文件路径（相对于 dag_dir），可包含 #section 锚点
+            dst_dir: 目标目录
+            dst_rel: 目标相对路径（默认与源文件同名同路径）
+        """
         base = self.dag_dir
         if "#" in src_pattern:
             path, section = src_pattern.split("#", 1)
@@ -478,7 +487,10 @@ class DAGScheduler:
         if not src.exists():
             return
 
-        dst = dst_dir / path.lstrip("/")
+        if dst_rel is not None:
+            dst = dst_dir / dst_rel.lstrip("/")
+        else:
+            dst = dst_dir / path.lstrip("/")
         dst.parent.mkdir(parents=True, exist_ok=True)
 
         if section:
