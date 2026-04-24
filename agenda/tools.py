@@ -20,7 +20,13 @@ class ToolRegistry:
     def __init__(self) -> None:
         self._tools: dict[str, ToolFunc] = {}
 
-    def register(self, name: str, func: ToolFunc) -> ToolFunc:
+    def register(self, name: str, func: ToolFunc | None = None) -> ToolFunc | Callable[[ToolFunc], ToolFunc]:
+        if func is None:
+            # 装饰器用法: @register("name")
+            def decorator(f: ToolFunc) -> ToolFunc:
+                self._tools[name] = f
+                return f
+            return decorator
         self._tools[name] = func
         return func
 
