@@ -23,7 +23,6 @@ from typing import Any
 from .const import DEFAULT_MAX_ITERATIONS, DEFAULT_NODE_TIMEOUT, MAX_SUB_AGENT_DEPTH
 from .session import Session
 from .models import ModelRegistry
-from .hooks import HookRegistry
 from .agent import AgentLoop
 from .tools import build_tools
 
@@ -89,14 +88,12 @@ class SubAgentManager:
 """
 
         child_tools = build_tools(child_session, allow_shell=False)
-        child_hooks = HookRegistry()
 
         async def _run_child() -> None:
             agent = AgentLoop(
                 session=child_session,
                 model_registry=self.model_registry,
                 tools=child_tools,
-                hooks=child_hooks,
                 model=model,
                 max_iterations=max_iterations,
                 timeout=timeout,

@@ -23,7 +23,6 @@ from typing import Any
 from .const import DEFAULT_MAX_ITERATIONS, DEFAULT_NODE_TIMEOUT
 from .session import Session
 from .models import ModelRegistry
-from .hooks import HookRegistry
 from .tools import ToolRegistry
 
 
@@ -48,7 +47,6 @@ class AgentLoop:
         session: Session,
         model_registry: ModelRegistry,
         tools: ToolRegistry,
-        hooks: HookRegistry | None = None,
         model: str | None = None,
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         timeout: float = DEFAULT_NODE_TIMEOUT,
@@ -57,7 +55,6 @@ class AgentLoop:
         self.model_registry = model_registry
         self.model_cfg = model_registry.get(model)
         self.tools = tools
-        self.hooks = hooks or HookRegistry()
         self.token_cap = self.model_cfg.token_cap
         self.messages: list[dict] = []
         self.max_iterations = max(1, max_iterations)
@@ -127,13 +124,11 @@ class AgentLoop:
                         "ts": datetime.now().isoformat(),
                     })
                     result = msg_dict.get("content", "")
-                    await self.hooks.fire("on_complete", self)
                     return result
 
                 # 执行 tools
                 pending_tool_calls: list[dict] = msg_dict.get("tool_calls", [])
                 for tc in pending_tool_calls:
-                    await self.hooks.fire("before_tool", self)
                     result = await self._execute_tool(tc)
                     tool_result = {
                         "role": "tool",
@@ -141,7 +136,6 @@ class AgentLoop:
                         "content": str(result)[:4000],
                     }
                     self.messages.append(tool_result)
-                    await self.hooks.fire("after_tool", self)
 
                 # 发送 progress 事件到 IPC（让外部观察者知道进度）
                 self.session.append_event({
@@ -159,10 +153,8 @@ class AgentLoop:
             committed = self.messages[turn_start_idx:]
             if committed:
                 self.session.save_partial_turn(committed, iteration, interrupted=True)
-            await self.hooks.fire("on_error", self)
             raise
         except Exception as e:
-            await self.hooks.fire("on_error", self)
             self.session.write_system("error.log", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
             raise
 

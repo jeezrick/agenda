@@ -24,7 +24,6 @@ from .const import (
 from .models import ModelConfig, ModelRegistry
 from .guardian import Guardian
 from .session import Session
-from .hooks import HookRegistry
 from .tools import ToolRegistry, build_tools
 from .agent import AgentLoop
 from .subagent import SubAgentManager
@@ -42,7 +41,6 @@ __all__ = [
     "ModelRegistry",
     "Guardian",
     "Session",
-    "HookRegistry",
     "ToolRegistry",
     "build_tools",
     "AgentLoop",

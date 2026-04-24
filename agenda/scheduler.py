@@ -21,7 +21,6 @@ except ImportError:
 from .const import DEFAULT_MAX_ITERATIONS, DEFAULT_NODE_TIMEOUT, DEFAULT_MAX_RETRIES
 from .session import Session
 from .models import ModelRegistry
-from .hooks import HookRegistry
 from .agent import AgentLoop
 from .subagent import SubAgentManager
 from .tools import ToolRegistry, build_tools
@@ -228,7 +227,6 @@ class DAGScheduler:
     async def run(
         self,
         tools_factory: Callable[[Session], ToolRegistry],
-        hooks_factory: Callable[[], HookRegistry] | None = None,
     ) -> dict[str, str]:
         """运行整个 DAG，返回每个节点的状态。"""
         max_parallel = self.dag.get("dag", {}).get("max_parallel", 4)
@@ -338,7 +336,7 @@ class DAGScheduler:
                 if self._cancelled:
                     break
                 task = asyncio.create_task(
-                    self._run_node(node_id, tools_factory, hooks_factory),
+                    self._run_node(node_id, tools_factory),
                     name=f"node_{node_id}",
                 )
                 pending_tasks[node_id] = task
@@ -385,7 +383,6 @@ class DAGScheduler:
         self,
         node_id: str,
         tools_factory: Callable[[Session], ToolRegistry],
-        hooks_factory: Callable[[], HookRegistry] | None,
     ) -> None:
         """运行单个节点。"""
         self.running.add(node_id)
@@ -397,7 +394,6 @@ class DAGScheduler:
             session = self.prepare_node(node_id)
 
             tools = tools_factory(session)
-            hooks = hooks_factory() if hooks_factory else HookRegistry()
 
             # 注入子 Agent 工具
             sub_manager = SubAgentManager(session, self.model_registry)
@@ -440,7 +436,6 @@ class DAGScheduler:
                 session=session,
                 model_registry=self.model_registry,
                 tools=tools,
-                hooks=hooks,
                 model=model_alias,
                 max_iterations=config.get("max_iterations", DEFAULT_MAX_ITERATIONS),
                 timeout=config.get("timeout", DEFAULT_NODE_TIMEOUT),
