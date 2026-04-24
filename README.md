@@ -279,11 +279,8 @@ report/                         # DAG 根目录
 
 ## 文档
 
-- [`docs/design.md`](docs/design.md) — 核心设计文档（文件即状态 / 目录即 Session / DAG 即编排 / Guardian 即边界）
+- [`docs/design.md`](docs/design.md) — 核心设计文档：算法、实现、实际流程、CLI 设计、架构决策
 - [`docs/DAG_FORMAT.md`](docs/DAG_FORMAT.md) — Meta Agent 的 DAG 格式规范
-- [`docs/cli-design.md`](docs/cli-design.md) — CLI 设计思路
-- [`docs/agenda-design.md`](docs/agenda-design.md) — 运行时架构设计
-- [`docs/multi-agent-runtime-ad.md`](docs/multi-agent-runtime-ad.md) — 架构决策记录
 
 ---
 

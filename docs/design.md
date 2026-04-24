@@ -13,13 +13,17 @@
 3. [目录即 Session](#目录即-session)
 4. [DAG 即编排](#dag-即编排)
 5. [Guardian 即边界](#guardian-即边界)
-6. [四者如何协同工作](#四者如何协同工作)
+6. [CLI 设计](#cli-设计)
+7. [四者如何协同工作](#四者如何协同工作)
+8. [设计来源与决策](#设计来源与决策)
 
 ---
 
 ## 概述
 
-Agenda 是一个给 **Meta Agent 调度子 Agent** 的运行时。它不是给人类用的交互工具，而是一个基础设施——Meta Agent 写一个 DAG，Agenda 自动调度执行，每个节点是一个独立 Agent，可以创建子 Agent，可以读写文件，可以中断后恢复。
+Agenda 是一个给 **Meta Agent 调度子 Agent** 的运行时。
+
+**这不是给人用的。** Claude Code、Cursor、Butterfly 都是人机交互界面，需要 TUI、实时流式输出、Web 面板。Agenda 不是。它的用户是另一个 AI Agent（或一个 Python 脚本），它的界面是文件系统和函数调用，不是终端。
 
 关键设计约束：
 - **无数据库**: 所有状态在文件系统
@@ -567,6 +571,99 @@ Ctrl+C 中断
     - turns.jsonl: 未完成节点恢复对话历史
     - 从断点继续
 ```
+
+---
+
+## CLI 设计
+
+CLI 是给另一个 Agent 用的接口，不是给人类用的交互式工具。
+
+### 设计原则
+
+| 原则 | 说明 |
+|------|------|
+| **一切皆可路径** | DAG 定义、模型配置、工作区，都用文件系统路径指定 |
+| **一切默认 JSON** | 每个命令输出机器可解析的结构，无人类可读分支 |
+| **环境变量兜底** | `AGENDA_DAG`、`AGENDA_MODELS` 提供默认值 |
+| **退出码语义化** | 0=成功，1=参数错误，2=DAG 配置错误，3=执行失败，4=依赖失败，130=中断 |
+
+### 环境变量
+
+```bash
+export AGENDA_DAG="./report/dag.yaml"           # 默认 DAG 路径
+export AGENDA_MODELS="~/.agenda/models.yaml"    # 默认模型配置
+export AGENDA_MAX_PARALLEL="4"                  # 默认最大并行度
+```
+
+设置后命令可简化为：`agenda dag run`、`agenda dag status`
+
+### 退出码
+
+| 退出码 | 含义 | 示例 |
+|--------|------|------|
+| 0 | 成功 | `dag run` 全部完成 |
+| 1 | 参数/命令错误 | `--node` 缺少值 |
+| 2 | DAG 配置错误 | 循环依赖，模型未定义 |
+| 3 | 节点执行失败 | LLM API 错误，tool 异常 |
+| 4 | 依赖失败导致无法继续 | 上游失败，下游阻塞 |
+| 130 | 用户中断 | Ctrl+C |
+
+---
+
+## 设计来源与决策
+
+### 为什么不是 Butterfly
+
+Butterfly 是 **Claude Code 的竞品** → 需要 PTY、Web UI、实时流、interrupt 队列。
+
+Butterfly 的 `session.py` 130KB 里，**80% 是交互式基础设施**（双队列输入分发、后台任务、SSE 桥接、thinking block 处理）。这些对 Agenda 来说是死重。
+
+Agenda 从 Butterfly 学的：
+- ✅ 双目录 Session（`.context/` + `.system/`）
+- ✅ Meta Session 种子逻辑（`prepare_node()` 的 hints 注入）
+- ✅ append-only JSONL 持久化（`turns.jsonl`）
+- ✅ turn 级别 commit（`save_turn`/`save_partial_turn`）
+- ✅ Guardian 路径边界（`resolve()` + `relative_to()`）
+
+Agenda 排除的：
+- ❌ 650KB+ 的 PTY 终端
+- ❌ ChatGPT OAuth
+- ❌ React 前端
+- ❌ 任务卡片系统
+- ❌ Web UI / SSE 桥接
+
+### 为什么不是 EVA
+
+EVA 是 **个人自动化脚本** → 单文件、单 Session、交互式对话。
+
+EVA 没有：
+- Session 间的上下文传递机制
+- 并发安全（JSON 快照有竞争条件）
+- DAG 调度
+
+Agenda 从 EVA 学的：
+- ✅ 极简主义精神
+- ✅ AI 自驱动记忆压缩（《紧急危机》prompt）
+- ✅ 单文件部署哲学（虽然 Agenda 已拆分为包，但保持了无重依赖）
+
+Agenda 排除的：
+- ❌ LLM 语义审查 shell 命令（不可靠，Guardian 硬边界已足够）
+- ❌ JSON 快照（改为 append-only JSONL）
+
+### 决策
+
+**Build Agenda as a new lightweight runtime**，取 Butterfly 的架构骨架 + EVA 的极简精神，加上原生 DAG 支持。
+
+| 维度 | Butterfly | EVA | Agenda |
+|------|-----------|-----|--------|
+| 目标用户 | 人类开发者 | 人类用户 | **Agent / 脚本** |
+| 交互模式 | TUI + Web UI | CLI 对话 | **文件系统 + JSON API** |
+| Session 隔离 | 双目录 + meta session | 目录级 JSON | **双目录 + DAG 原生** |
+| 并发安全 | JSONL append | JSON 快照（竞争） | **JSONL append + 文件锁** |
+| 记忆压缩 | 无 | AI 自驱动 | **AI 自驱动** |
+| 安全边界 | 无 | LLM 审查 | **Guardian 硬边界** |
+| 代码量 | ~500KB | 27KB | **~2400 行** |
+| DAG | 无 | 无 | **原生** |
 
 ---
 
