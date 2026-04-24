@@ -4,7 +4,7 @@
 
 Agenda 是一个原生支持 DAG（有向无环图）的 Agent 运行时。它不是给人类用的交互式工具（如 Claude Code），而是给 **Meta Agent 编排子 Agent** 的基础设施。
 
-设计哲学：**文件即状态，目录即 Session，DAG 即编排，Hook 即策略，Guardian 即边界。**
+设计哲学：**文件即状态，目录即 Session，DAG 即编排，Guardian 即边界。**
 
 ---
 
@@ -162,18 +162,15 @@ agenda node history ./report/dag.yaml --node=write_report
 
 ---
 
-## CLI 命令参考
+## CLI 命令参考（默认 JSON 输出）
 
 ### DAG 管理
 
 ```bash
-agenda dag init <path>                          # 初始化 DAG 工作区
 agenda dag create --from-json <file> -o <yaml>  # JSON → YAML（Meta Agent 推荐）
-agenda dag validate <path> [--json]             # 验证 DAG 配置
-agenda dag inspect <path> [--json]              # 查看拓扑结构
+agenda dag validate <path>                      # 验证 DAG 配置
 agenda dag run <path> [--models <path>] [--max-parallel N] [--dry-run]
-agenda dag status <path> [--json] [--watch]
-agenda dag stop <path>
+agenda dag status <path> [--watch]
 ```
 
 ### 节点管理
@@ -181,8 +178,7 @@ agenda dag stop <path>
 ```bash
 agenda node run <path> --node <id> [--force]    # 运行/重跑单个节点
 agenda node reset <path> --node <id>            # 重置节点（清空目录）
-agenda node logs <path> --node <id> [--tail N]  # 查看错误日志
-agenda node history <path> --node <id> [--json] # 查看对话历史（turns.jsonl）
+agenda node history <path> --node <id>          # 查看对话历史（turns.jsonl）
 ```
 
 ### Daemon 管理
@@ -196,8 +192,8 @@ agenda daemon status <path>                     # 查看状态
 ### 模型管理
 
 ```bash
-agenda models list [--config <path>] [--json]
-agenda models validate [--config <path>]
+agenda models list                              # 列出可用模型
+agenda models validate                          # 验证模型配置
 ```
 
 ### 环境变量
