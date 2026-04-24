@@ -193,13 +193,19 @@ class DAGScheduler:
         session.set_state("status", "running")
         session.set_state("started_at", datetime.now().isoformat())
 
+        # 0. 重试时清理旧产物（避免残留干扰）
+        done_marker = session.output_dir / "draft.md"
+        if done_marker.exists():
+            done_marker.unlink()
+            print(f"  [节点 {node_id}] 清理旧产物 output/draft.md")
+
         # 1. 复制 meta inputs
         for src_pattern in config.get("inputs", []):
-            self._copy_input(src_pattern, session.context_dir)
+            self._copy_input(src_pattern, session.input_dir)
 
         # 2. 复制依赖产物（支持 #section 锚点）
         for mapping in config.get("dep_inputs", []):
-            self._copy_input(mapping["from"], session.context_dir, dst_rel=mapping["to"])
+            self._copy_input(mapping["from"], session.input_dir, dst_rel=mapping["to"])
 
         # 3. 恢复历史（如果之前有中断）
         loaded = session.replay_history()
@@ -208,17 +214,17 @@ class DAGScheduler:
 
         # 4. 扫描可用输入文件
         available_files = []
-        if session.context_dir.exists():
-            for f in sorted(session.context_dir.rglob("*")):
+        if session.input_dir.exists():
+            for f in sorted(session.input_dir.rglob("*")):
                 if f.is_file():
-                    rel = f.relative_to(session.context_dir)
+                    rel = f.relative_to(session.input_dir)
                     available_files.append(str(rel))
 
         files_section = ""
         if available_files:
             files_section = "\n## 可用输入文件\n"
             for p in available_files:
-                files_section += f'- read_file(".context/{p}")\n'
+                files_section += f'- read_file("input/{p}")\n'
 
         # 列出依赖产物（如果有）
         dep_section = ""
@@ -227,7 +233,7 @@ class DAGScheduler:
             dep_section = "\n## 前置依赖产物\n"
             for mapping in dep_inputs:
                 to_path = mapping["to"].lstrip("/")
-                dep_section += f'- read_file(".context/{to_path}")\n'
+                dep_section += f'- read_file("input/{to_path}")\n'
 
         # 5. 写 hints
         hints = f"""# DAG 任务: {node_id}
@@ -235,8 +241,9 @@ class DAGScheduler:
 {config.get('prompt', '')}{files_section}{dep_section}
 ## 规则
 - 用 read_file / write_file 工具操作文件
-- 按需读取 .context/ 下的内容，不要一次性加载所有
-- 完成后写入 output/draft.md
+- 按需读取 input/ 下的内容，不要一次性加载所有
+- workspace/ 可放草稿和中间产物
+- 完成后将最终产物写入 output/draft.md
 - 如需创建子 Agent，使用 spawn_child 工具
 """
         session.write_system("hints.md", hints)
@@ -441,21 +448,23 @@ class DAGScheduler:
 
 # 可用工具
 你可以调用以下工具来操作文件系统：
-- read_file(path): 读取 .context/ 或 output/ 下的文件
-  例: read_file(".context/book/outline.md")
-- write_file(path, content): 写入 output/ 目录
-  例: write_file("output/draft.md", "# 标题...")
-- list_dir(path): 列出 .context/ 或 output/ 下的目录内容
-  提示: list_dir(".") 等价于 list_dir(".context")，会展示输入文件
-  例: list_dir(".context")、list_dir("output")
+- read_file(path): 读取 input/、workspace/ 或 output/ 下的文件
+  例: read_file("input/book/outline.md")
+- write_file(path, content): 写入 workspace/ 或 output/ 目录
+  例: write_file("workspace/draft.md", "# 草稿...")
+  例: write_file("output/draft.md", "# 最终产物...")
+- list_dir(path): 列出目录内容
+  提示: list_dir(".") 会展示 input/、workspace/、output/ 的概览
+  例: list_dir("input")、list_dir("workspace")、list_dir("output")
 - spawn_child(task, name, model?): 创建子 Agent 执行子任务
 - wait_for_child(name, timeout?): 等待子 Agent 完成
 - list_children(): 列出所有子 Agent
 
 # 工作目录结构
 你的可见范围仅限以下目录：
-  .context/   ← 输入文件（大纲、计划、证据、前置章节等）
-  output/     ← 你的产出文件
+  input/      ← 系统输入（大纲、计划、证据、前置章节等），只读
+  workspace/  ← 你的工作区（草稿、笔记、中间产物），可读写
+  output/     ← 最终产物（如 draft.md），可写
 """
 
             agent = AgentLoop(
@@ -472,7 +481,7 @@ class DAGScheduler:
 
             # 写入产物（如果 Agent 没有自己写）
             if not session.output_exists and result:
-                session.write_output("draft.md", result)
+                session.write_file("output/draft.md", result)
 
             session.set_state("status", "completed")
             session.set_state("completed_at", datetime.now().isoformat())

@@ -106,7 +106,7 @@ class SubAgentManager:
                     "finished_at": datetime.now().isoformat(),
                 })
                 if not child_session.output_exists:
-                    child_session.write_output("draft.md", result)
+                    child_session.write_file("output/draft.md", result)
             except asyncio.CancelledError:
                 child_session.append_event({
                     "type": "cancelled",

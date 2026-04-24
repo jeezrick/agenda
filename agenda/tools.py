@@ -78,24 +78,24 @@ class ToolRegistry:
 def build_tools(session: Session, allow_shell: bool = False) -> ToolRegistry:
     """
     为给定 Session 创建工具注册表。
-    工具被限制在该 Session 的 .context/ 和 output/ 内。
+    工具被限制在该 Session 的 input/、workspace/ 和 output/ 内。
     """
     tools = ToolRegistry()
 
     @tools.register("read_file")
     def read_file(path: str) -> str:
-        """读取 .context/ 或 output/ 下的文件内容。"""
-        return session.read_context(path)
+        """读取 input/、workspace/ 或 output/ 下的文件内容。"""
+        return session.read_file(path)
 
     @tools.register("write_file")
     def write_file(path: str, content: str) -> str:
-        """写入 output/ 目录。"""
-        return session.write_output(path, content)
+        """写入 workspace/ 或 output/ 目录。"""
+        return session.write_file(path, content)
 
     @tools.register("list_dir")
     def list_dir(path: str = ".") -> str:
-        """列出 .context/ 或 output/ 下的目录内容。"""
-        return session.list_context(path)
+        """列出 input/、workspace/ 或 output/ 下的目录内容。"""
+        return session.list_dir(path)
 
     @tools.register("done_compact")
     def done_compact() -> str:
