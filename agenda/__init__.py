@@ -29,7 +29,6 @@ from .tools import ToolRegistry, build_tools
 from .agent import AgentLoop
 from .subagent import SubAgentManager
 from .scheduler import DAGScheduler
-from .security import SecurityReviewer
 from .daemon import NodeWatcher
 from .cli import cli
 
@@ -49,7 +48,6 @@ __all__ = [
     "AgentLoop",
     "SubAgentManager",
     "DAGScheduler",
-    "SecurityReviewer",
     "NodeWatcher",
     "cli",
 ]

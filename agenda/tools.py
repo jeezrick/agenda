@@ -8,7 +8,7 @@ import json
 from typing import Any, Callable
 
 from .session import Session
-from .security import SecurityReviewer
+
 
 
 ToolFunc = Callable[..., str]
@@ -69,7 +69,7 @@ class ToolRegistry:
 
 
 
-def build_tools(session: Session, allow_shell: bool = False, llm_client: Any | None = None) -> ToolRegistry:
+def build_tools(session: Session, allow_shell: bool = False) -> ToolRegistry:
     """
     为给定 Session 创建工具注册表。
     工具被限制在该 Session 的 .context/ 和 output/ 内。
@@ -96,25 +96,13 @@ def build_tools(session: Session, allow_shell: bool = False, llm_client: Any | N
         """通知系统记忆压缩已完成。"""
         return "[系统] 记忆压缩完成"
 
-    # 可选：shell 工具（带安全审查）
-    if allow_shell and llm_client:
-        reviewer = SecurityReviewer(llm_client)
+    # 可选：shell 工具（受 Guardian 路径边界保护）
+    if allow_shell:
 
         @tools.register("run_shell")
         def run_shell(command: str, timeout: int = 30) -> str:
-            """执行 shell 命令（仅限读操作，写入/执行需审查）。"""
+            """执行 shell 命令。Guardian 保证文件操作在 node_dir 内。"""
             import subprocess
-
-            # 安全检查
-            import asyncio
-            loop = asyncio.new_event_loop()
-            try:
-                allowed = loop.run_until_complete(reviewer.review(command))
-            finally:
-                loop.close()
-
-            if not allowed:
-                return "[安全审查] 命令被拒绝。如需执行，请用 read_file / write_file 操作文件。"
 
             try:
                 result = subprocess.run(
