@@ -206,13 +206,36 @@ class DAGScheduler:
         if loaded:
             print(f"  [节点 {node_id}] 恢复 {len(loaded)} 条历史消息")
 
-        # 4. 写 hints
+        # 4. 扫描可用输入文件
+        available_files = []
+        if session.context_dir.exists():
+            for f in sorted(session.context_dir.rglob("*")):
+                if f.is_file():
+                    rel = f.relative_to(session.context_dir)
+                    available_files.append(str(rel))
+
+        files_section = ""
+        if available_files:
+            files_section = "\n## 可用输入文件\n"
+            for p in available_files:
+                files_section += f'- read_file(".context/{p}")\n'
+
+        # 列出依赖产物（如果有）
+        dep_section = ""
+        dep_inputs = config.get("dep_inputs", [])
+        if dep_inputs:
+            dep_section = "\n## 前置依赖产物\n"
+            for mapping in dep_inputs:
+                to_path = mapping["to"].lstrip("/")
+                dep_section += f'- read_file(".context/{to_path}")\n'
+
+        # 5. 写 hints
         hints = f"""# DAG 任务: {node_id}
 ## 提示
-{config.get('prompt', '')}
+{config.get('prompt', '')}{files_section}{dep_section}
 ## 规则
 - 用 read_file / write_file 工具操作文件
-- 按需读取 input/ 下的内容，不要一次性加载所有
+- 按需读取 .context/ 下的内容，不要一次性加载所有
 - 完成后写入 output/draft.md
 - 如需创建子 Agent，使用 spawn_child 工具
 """
