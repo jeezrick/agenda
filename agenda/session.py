@@ -202,6 +202,37 @@ class Session:
         if self._turns_path.exists():
             self._turns_path.unlink()
 
+    def rotate_turns(self) -> Path | None:
+        """Rotate turns.jsonl 到备份文件，返回备份路径。"""
+        if not self._turns_path.exists():
+            return None
+        # 找下一个可用的备份编号
+        for i in range(1, 100):
+            backup = self._turns_path.with_suffix(f".jsonl.{i}")
+            if not backup.exists():
+                self._turns_path.replace(backup)
+                return backup
+        return None
+
+    def write_system_turn(self, prompt: str) -> None:
+        """在 turns.jsonl 开头写入 system prompt 记录。
+
+        如果文件已有内容，通过临时文件原子 prepend。
+        """
+        line = json.dumps({"role": "_system_prompt", "content": prompt}, ensure_ascii=False) + "\n"
+        if not self._turns_path.exists() or self._turns_path.stat().st_size == 0:
+            self._turns_path.write_text(line, encoding="utf-8")
+            return
+        tmp = self._turns_path.with_suffix(".tmp")
+        tmp.write_text(line, encoding="utf-8")
+        with tmp.open("a", encoding="utf-8") as tmp_f, self._turns_path.open(encoding="utf-8") as src_f:
+            while True:
+                chunk = src_f.read(64 * 1024)
+                if not chunk:
+                    break
+                tmp_f.write(chunk)
+        tmp.replace(self._turns_path)
+
     # --- IPC: events.jsonl ---
 
     def append_event(self, event: dict) -> None:

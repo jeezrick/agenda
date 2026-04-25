@@ -2,13 +2,13 @@ from __future__ import annotations
 
 """Agent Loop — 核心循环（加固版）。
 
-学 Butterfly + EVA 的加固措施：
+学 Butterfly + EVA + Kimi Code 的加固措施：
 - max_iterations: 防止无限循环（默认 50）
 - timeout: 节点级超时（默认 600s）
 - turn 级别持久化（每轮后 save_turn，取消时 save_partial_turn）
 - IPC 事件轮询（每轮前检查 events.jsonl，支持外部中断/消息）
 - 取消时补全 pending tool_calls（防止下次运行 400）
-- AI 自驱动记忆压缩
+- 系统驱动记忆压缩（SimpleCompaction，保留最近 N 条，LLM 生成结构化摘要）
 """
 
 import asyncio
@@ -20,7 +20,13 @@ import traceback
 from datetime import datetime
 from typing import Any
 
-from .const import DEFAULT_MAX_ITERATIONS, DEFAULT_NODE_TIMEOUT
+from .compaction import SimpleCompaction, estimate_text_tokens, should_auto_compact
+from .const import (
+    DEFAULT_COMPACTION_RESERVED,
+    DEFAULT_COMPACTION_TRIGGER_RATIO,
+    DEFAULT_MAX_ITERATIONS,
+    DEFAULT_NODE_TIMEOUT,
+)
 from .session import Session
 from .models import ModelRegistry
 from .tools import ToolRegistry
@@ -105,10 +111,21 @@ class AgentLoop:
                 # IPC 事件轮询（学 Butterfly 的 poll_inputs）
                 await self._poll_events()
 
-                # 记忆压缩检查
-                if self._estimate_tokens() > self.token_cap * 0.75:
-                    await self._compact_memory()
-                    turn_start_idx = len(self.messages)
+                # 系统驱动记忆压缩（学 Kimi Code）
+                token_count = estimate_text_tokens(self.messages)
+                if should_auto_compact(
+                    token_count,
+                    self.token_cap,
+                    trigger_ratio=DEFAULT_COMPACTION_TRIGGER_RATIO,
+                    reserved_context_size=DEFAULT_COMPACTION_RESERVED,
+                ):
+                    print(f"  [压缩] Context too long ({token_count} tokens), compacting...")
+                    try:
+                        await self._compact_context(system_prompt)
+                        turn_start_idx = len(self.messages)
+                    except Exception as compact_err:
+                        print(f"  [压缩失败] {type(compact_err).__name__}: {compact_err}")
+                        raise
 
                 # 调用 LLM
                 response = await self._call_llm()
@@ -286,59 +303,30 @@ class AgentLoop:
                 }
                 self.messages.append(synthetic)
 
-    async def _compact_memory(self) -> None:
-        """AI 自驱动记忆压缩（从 EVA 移植）。"""
-        compact_prompt = """《紧急危机》！！！记忆容量即将达到上限。
+    async def _compact_context(self, system_prompt: str) -> None:
+        """系统驱动记忆压缩（学 Kimi Code CLI）。"""
+        compactor = SimpleCompaction(max_preserved_messages=2)
+        compacted = await compactor.compact(
+            self.messages,
+            client=self._get_client(self.model_cfg),
+            model=self.model_cfg.model,
+        )
 
-你需要紧急完成三件事：
-1. 保存记忆：把当前对话中对完成任务有用的内容，整理成 Markdown 文件，
-   写入 .system/memory/YYYYMMDD_N.md
-2. 保存技能：提炼对未来有用的知识/技能，写入 .system/skills/
-3. 更新线索：修改 .system/hints.md，留下检索线索
+        # 重建 context：rotate 旧文件 → 重写 system prompt → 写入压缩结果
+        backup = self.session.rotate_turns()
+        if backup:
+            print(f"  [压缩] 旧 turns 已 rotate 到 {backup.name}")
 
-可以创建新文件，也可以追加已有文件。
-完成后，调用 done_compact 工具通知系统。
-不要请求用户确认，直接执行。"""
-
-        self.messages.append({"role": "user", "content": compact_prompt})
-
-        for _ in range(3):
-            response = await self._call_llm()
-            msg = response["choices"][0]["message"]
-            msg_dict = self._msg_to_dict(msg)
-            self.messages.append(msg_dict)
-
-            if not msg_dict.get("tool_calls"):
-                break
-
-            for tc in msg_dict["tool_calls"]:
-                result = await self._execute_tool(tc)
-                tr = {
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "content": str(result)[:4000],
-                }
-                self.messages.append(tr)
-
-        # 压缩后截断：保留 system + 最近 4 轮
-        self.messages = [self.messages[0]] + self.messages[-4:]
-        # 重新持久化截断后的历史
+        self.messages = list(compacted.messages)
         self.session.clear_turns()
-        turn = {
+        self.session.write_system_turn(system_prompt)
+        self.session.save_turn({
             "type": "turn",
             "messages": list(self.messages),
             "compact": True,
             "ts": datetime.now().isoformat(),
-        }
-        self.session.save_turn(turn)
-        print("  [记忆压缩完成]")
-
-    def _estimate_tokens(self) -> int:
-        """粗略估算 token 数。"""
-        text = json.dumps(self.messages, ensure_ascii=False)
-        cn = len(re.findall(r"[\u4e00-\u9fff]", text))
-        en = len(text) - cn
-        return int(cn * 1.5 + en * 0.5)
+        })
+        print(f"  [压缩完成] 保留 {len(self.messages)} 条消息")
 
     def _msg_to_dict(self, msg: Any) -> dict:
         """把 LLM 返回的消息对象转成 dict。"""
