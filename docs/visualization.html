@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>Agenda 递归设计可视化</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #f5f7fa;
+    padding: 40px;
+    line-height: 1.6;
+  }
+  h1 { text-align: center; margin-bottom: 10px; color: #1a1a2e; }
+  .subtitle { text-align: center; color: #666; margin-bottom: 40px; }
+
+  .container {
+    max-width: 1200px;
+    margin: 0 auto;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 30px;
+  }
+
+  .panel {
+    background: white;
+    border-radius: 12px;
+    padding: 25px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+  }
+  .panel h2 {
+    font-size: 18px;
+    margin-bottom: 20px;
+    padding-bottom: 10px;
+    border-bottom: 2px solid #e0e0e0;
+  }
+
+  /* 递归调用树 */
+  .tree {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .tree-level {
+    display: flex;
+    justify-content: center;
+    gap: 20px;
+    margin: 8px 0;
+    position: relative;
+  }
+  .node {
+    padding: 10px 16px;
+    border-radius: 8px;
+    font-size: 13px;
+    font-family: 'SF Mono', Monaco, monospace;
+    position: relative;
+    min-width: 140px;
+    text-align: center;
+  }
+  .node.scheduler {
+    background: #e3f2fd;
+    border: 2px solid #2196f3;
+    color: #1565c0;
+  }
+  .node.base {
+    background: #e8f5e9;
+    border: 2px solid #4caf50;
+    color: #2e7d32;
+  }
+  .node .label {
+    font-weight: bold;
+    font-size: 12px;
+    margin-bottom: 4px;
+  }
+  .node .detail {
+    font-size: 11px;
+    opacity: 0.8;
+  }
+
+  /* 连接线 */
+  .tree-level:not(:first-child)::before {
+    content: '';
+    position: absolute;
+    top: -16px;
+    left: 50%;
+    width: 2px;
+    height: 16px;
+    background: #ccc;
+    transform: translateX(-50%);
+  }
+
+  /* 并排的子节点连接线 */
+  .tree-children {
+    display: flex;
+    justify-content: center;
+    gap: 20px;
+    position: relative;
+    padding-top: 16px;
+  }
+  .tree-children::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 25%;
+    right: 25%;
+    height: 2px;
+    background: #ccc;
+  }
+  .child-wrapper {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    position: relative;
+  }
+  .child-wrapper::before {
+    content: '';
+    position: absolute;
+    top: -16px;
+    width: 2px;
+    height: 16px;
+    background: #ccc;
+  }
+
+  /* 对比表格 */
+  .compare-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+  }
+  .compare-table th {
+    background: #1a1a2e;
+    color: white;
+    padding: 12px;
+    text-align: left;
+  }
+  .compare-table td {
+    padding: 12px;
+    border-bottom: 1px solid #eee;
+  }
+  .compare-table tr:nth-child(even) {
+    background: #f8f9fa;
+  }
+  .code {
+    font-family: 'SF Mono', Monaco, monospace;
+    background: #f4f4f4;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 12px;
+  }
+
+  /* 视角卡片 */
+  .perspective {
+    background: #fafafa;
+    border-left: 4px solid #2196f3;
+    padding: 15px;
+    margin: 10px 0;
+    border-radius: 0 8px 8px 0;
+  }
+  .perspective h4 {
+    color: #1565c0;
+    margin-bottom: 8px;
+    font-size: 14px;
+  }
+  .perspective ul {
+    margin-left: 20px;
+    font-size: 13px;
+    color: #555;
+  }
+  .perspective li {
+    margin: 4px 0;
+  }
+
+  .legend {
+    display: flex;
+    gap: 20px;
+    justify-content: center;
+    margin-top: 20px;
+    font-size: 13px;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .legend-box {
+    width: 16px;
+    height: 16px;
+    border-radius: 4px;
+    border: 2px solid;
+  }
+
+  .full-width {
+    grid-column: 1 / -1;
+  }
+
+  .arrow {
+    text-align: center;
+    color: #999;
+    font-size: 20px;
+    margin: 5px 0;
+  }
+</style>
+</head>
+<body>
+
+<h1>🌲 Agenda 作为递归函数</h1>
+<p class="subtitle">agenda(dag, inputs, depth=0) — 一棵由 Agent 决策驱动的递归调用树</p>
+
+<div class="container">
+
+  <!-- 递归调用树 -->
+  <div class="panel full-width">
+    <h2>递归调用树</h2>
+    <div class="tree">
+      <!-- Depth 0 -->
+      <div class="tree-level">
+        <div class="node scheduler">
+          <div class="label">agenda(depth=0)</div>
+          <div class="detail">DAG: [大纲, Ch1, Ch2]</div>
+        </div>
+      </div>
+      <div class="arrow">▼</div>
+      <!-- Depth 0 → Agents -->
+      <div class="tree-children">
+        <div class="child-wrapper">
+          <div class="node base">
+            <div class="label">AgentLoop</div>
+            <div class="detail">任务: 大纲</div>
+            <div class="detail">Base Case ✓</div>
+          </div>
+        </div>
+        <div class="child-wrapper">
+          <div class="node scheduler">
+            <div class="label">agenda(depth=1)</div>
+            <div class="detail">DAG: [1.1, 1.2]</div>
+          </div>
+          <div class="arrow">▼</div>
+          <div class="tree-children">
+            <div class="child-wrapper">
+              <div class="node base">
+                <div class="label">AgentLoop</div>
+                <div class="detail">任务: 1.1 背景</div>
+                <div class="detail">Base Case ✓</div>
+              </div>
+            </div>
+            <div class="child-wrapper">
+              <div class="node scheduler">
+                <div class="label">agenda(depth=2)</div>
+                <div class="detail">DAG: [1.2.1]</div>
+              </div>
+              <div class="arrow">▼</div>
+              <div class="child-wrapper">
+                <div class="node base">
+                  <div class="label">AgentLoop</div>
+                  <div class="detail">任务: 1.2.1 细节</div>
+                  <div class="detail">Base Case ✓</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="child-wrapper">
+          <div class="node base">
+            <div class="label">AgentLoop</div>
+            <div class="detail">任务: 第二章</div>
+            <div class="detail">Base Case ✓</div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="legend">
+      <div class="legend-item">
+        <div class="legend-box" style="background:#e3f2fd; border-color:#2196f3;"></div>
+        <span>Recursive Step (Scheduler + 多 Agent)</span>
+      </div>
+      <div class="legend-item">
+        <div class="legend-box" style="background:#e8f5e9; border-color:#4caf50;"></div>
+        <span>Base Case (AgentLoop.run())</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- 递归函数类比 -->
+  <div class="panel">
+    <h2>🔁 传统递归函数</h2>
+    <table class="compare-table">
+      <tr><th>要素</th><th>fibonacci(n)</th></tr>
+      <tr><td>Base Case</td><td><span class="code">n &lt;= 1: return n</span></td></tr>
+      <tr><td>Recursive Step</td><td><span class="code">return fib(n-1) + fib(n-2)</span></td></tr>
+      <tr><td>调用者</td><td>函数自己</td></tr>
+      <tr><td>参数</td><td>更小的子问题 <span class="code">n-1, n-2</span></td></tr>
+      <tr><td>收敛条件</td><td><span class="code">n</span> 递减到 0</td></tr>
+      <tr><td>叶子节点</td><td>返回数值</td></tr>
+    </table>
+  </div>
+
+  <div class="panel">
+    <h2>🌲 Agenda 递归</h2>
+    <table class="compare-table">
+      <tr><th>要素</th><th>agenda(dag, inputs)</th></tr>
+      <tr><td>Base Case</td><td><span class="code">len(dag)==1: AgentLoop.run()</span></td></tr>
+      <tr><td>Recursive Step</td><td><span class="code">Scheduler → Agent → agenda()</span></td></tr>
+      <tr><td>调用者</td><td>Agent Loop 里的 Agent</td></tr>
+      <tr><td>参数</td><td>子 DAG + 子输入</td></tr>
+      <tr><td>收敛条件</td><td><span class="code">depth</span> 递增到 MAX_DEPTH</td></tr>
+      <tr><td>叶子节点</td><td>AgentLoop.run()</td></tr>
+    </table>
+  </div>
+
+  <!-- 三个视角 -->
+  <div class="panel full-width">
+    <h2>👁️ 三个视角</h2>
+
+    <div class="perspective">
+      <h4>Meta Agent 视角</h4>
+      <ul>
+        <li>我有一个大任务"写一本书"</li>
+        <li>我把它拆成 DAG: [大纲, Ch1, Ch2]</li>
+        <li>我调用 <span class="code">agenda(my_dag, inputs)</span></li>
+        <li>等待结果返回</li>
+      </ul>
+    </div>
+
+    <div class="perspective">
+      <h4>Agent Loop 视角（任意一个 Agent）</h4>
+      <ul>
+        <li>我收到了一个 Task"写第一章"</li>
+        <li>我有一个 Workspace（input/ workspace/ output/）</li>
+        <li>我可以调用 <span class="code">agenda(sub_dag, inputs)</span> 继续分解</li>
+        <li>我也可以直接执行，写完输出到 output/</li>
+        <li>我不知道外面还有多少层 agenda()</li>
+      </ul>
+    </div>
+
+    <div class="perspective">
+      <h4>DAG Runner 视角</h4>
+      <ul>
+        <li>我收到了一个 DAG</li>
+        <li>我并行启动所有就绪的节点</li>
+        <li>每个节点 = AgentLoop.run()</li>
+        <li>我不关心 Agent 内部做了什么</li>
+        <li>我等待所有节点完成，收集产物</li>
+      </ul>
+    </div>
+  </div>
+
+  <!-- 核心公式 -->
+  <div class="panel full-width">
+    <h2>⚡ 核心公式</h2>
+    <div style="background:#1a1a2e; color:#fff; padding:20px; border-radius:8px; font-family:monospace; font-size:15px; line-height:2;">
+      agenda(dag, inputs, depth=0):<br>
+      &nbsp;&nbsp;if len(dag.nodes) == 1:<br>
+      &nbsp;&nbsp;&nbsp;&nbsp;return AgentLoop(dag.nodes[0], inputs).run() &nbsp;&nbsp;// Base Case<br>
+      &nbsp;&nbsp;else:<br>
+      &nbsp;&nbsp;&nbsp;&nbsp;return Scheduler(dag, inputs, depth).run() &nbsp;&nbsp;// Recursive Step<br>
+      &nbsp;&nbsp;&nbsp;&nbsp;// Scheduler 内部的 Agent 可再次调用 agenda()
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>
