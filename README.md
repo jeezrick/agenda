@@ -259,9 +259,3 @@ if len(dag.nodes) == 1:
 2. **Agent 可调用 `agenda()`** — Agent Loop 里的 Agent 构造子 DAG 后直接调用 `agenda()` 实现递归
 3. **Base Case 优化** — 单节点 DAG 跳过 Scheduler，直接 `AgentLoop.run()`
 4. **`agenda()` 顶层函数** — 统一入口，替代当前的直接 Scheduler 调用
-
----
-
-## 一句话总结
-
-> **递归不在 Agent Loop 里，递归在 DAG 的嵌套里。Agent Loop 永远是叶子节点，永远是 Base Case。**
