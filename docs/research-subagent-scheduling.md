@@ -1,6 +1,6 @@
 # Subagent 调度机制调研报告
 
-> 调研对象：Butterfly Agent、Claw Code、Kimi CLI  
+> 调研对象：Butterfly Agent、Claw Code、Kimi CLI、Claude Code  
 > 调研目的：为 Agenda 的 DAG 层设计提供参考，明确"Subagent 一等公民"的实现路径
 
 ---
@@ -548,52 +548,339 @@ status: completed
 
 ---
 
-## 四、综合对比
+## 四、Claude Code
 
-### 4.1 调度机制对比
+### 4.1 架构概览
 
-| 维度 | Butterfly | Claw Code | Kimi CLI | **Agenda 目标** |
-|-----|-----------|-----------|----------|----------------|
-| **调度粒度** | 独立 daemon 进程 | 独立 OS 线程 | 同进程 async task | 同进程 async（轻量） |
-| **触发方式** | `subagent_new` tool | `Agent` tool | `Agent` tool | `agenda()` 函数（普通函数调用） |
-| **阻塞方式** | 同步/后台 | 仅后台（线程） | 前台/后台 | 前台（await） |
-| **生命周期** | manifest + watcher | 线程启动/结束 | async task | 函数调用/返回 |
+Claude Code 采用**同进程 async + 可选独立工作目录**模型。Subagent（称为 Agent Tool 或 Forked Agent）使用与主循环完全相同的 `query()` 函数，通过 `ToolUseContext` 实现隔离。
 
-### 4.2 Context 传递对比
+```
+Parent Async Context
+  ├── AgentTool.call()  →  AgentTool.tsx
+  │     ├── resolveAgentType()        ← 决定 agent type / fork
+  │     ├── runAgent()                ← 通用 subagent 执行
+  │     │     ├── createSubagentContext()     ← 隔离的 ToolUseContext
+  │     │     │     ├── readFileState: 克隆（独立）
+  │     │     │     ├── abortController: 新建（继承 parent）
+  │     │     │     ├── queryTracking: 新链（depth+1）
+  │     │     │     └── agentId, agentType: subagent 标记
+  │     │     ├── resolveAgentTools()         ← 按 agent type 过滤工具
+  │     │     ├── getAgentSystemPrompt()      ← 整体替换 prompt
+  │     │     └── query()                     ← 同一个 query 循环
+  │     │           └── recordSidechainTranscript()
+  │     │
+  │     └── 异步模式: registerAsyncAgent() + runAsyncAgentLifecycle()
+  │
+  └── runForkedAgent()  →  forkedAgent.ts
+        ├── 字节级缓存共享（CacheSafeParams 匹配主线程 cache key）
+        ├── maxTurns=1 的受限 loop
+        └── 用于: compact / session memory / promptSuggestion / /btw
+```
 
-| 维度 | Butterfly | Claw Code | Kimi CLI | **Agenda 目标** |
-|-----|-----------|-----------|----------|----------------|
-| **消息历史** | ❌ 不传递 | ❌ 不传递 | ❌ 不传递 | ❌ 不传递（显式 inputs） |
-| **System prompt** | 复制 system.md | 重建 | 从 spec 加载 | Agent Loop 统一（不区分 main/sub） |
-| **环境变量** | `BUTTERFLY_SESSION_ID` | 共享进程环境 | 共享 `builtin_args` | 通过 `inputs` 显式传递 |
-| **文件访问** | Symlink 读父目录 | 共享文件系统 | 共享文件系统 | `dep_inputs` 路由 + Workspace 隔离 |
-| **工具限制** | Guardian + mode | 白名单 | `tool_policy` allowlist | 无限制（`agenda()` 就是普通 tool） |
+**两种 subagent 路径**：
 
-### 4.3 结果回传对比
+| 路径 | 入口 | 用途 | 缓存策略 |
+|------|------|------|---------|
+| **AgentTool** | `AgentTool.call()` | 用户触发的子代理（Explore/Plan/异步任务） | 独立 cache |
+| **Forked Agent** | `runForkedAgent()` | 系统内部子任务（compact/session memory 等） | 共享主线程 cache |
 
-| 维度 | Butterfly | Claw Code | Kimi CLI | **Agenda 目标** |
-|-----|-----------|-----------|----------|----------------|
-| **回传方式** | 轮询 context.jsonl | 写入文件 | 提取最后消息 | `output/` 目录 + `dep_inputs` |
-| **结构化** | 纯文本（8000字截断） | 纯文本（markdown） | 纯文本 | 文件产物（任意格式） |
-| **自动注入** | ✅ 后台模式自动注入 | ❌ 需主动读取 | ✅ Foreground 自动返回 | ✅ `dep_inputs` 自动路由 |
+### 4.2 调度入口
 
-### 4.4 隔离与限制对比
+**主入口：`AgentTool`**（`src/tools/AgentTool/AgentTool.tsx:239`）
 
-| 维度 | Butterfly | Claw Code | Kimi CLI | **Agenda 目标** |
-|-----|-----------|-----------|----------|----------------|
-| **Workspace 隔离** | ✅ 完整目录隔离 | ❌ 无隔离 | ❌ 共享目录 | ✅ 独立 workspace |
-| **Session 隔离** | ✅ 独立 context.jsonl | ✅ 独立 Session | ✅ 独立 context.jsonl | ✅ 独立 session |
-| **进程隔离** | ✅ 独立 daemon | ✅ 独立线程 | ❌ 同进程 | ❌ 同进程（轻量） |
-| **嵌套深度** | `MAX_DEPTH = 2` | 禁止（白名单） | 禁止（role 检查） | `MAX_DEPTH` 软限制 |
-| **Subagent 等级** | 二等公民 | 二等公民 | 二等公民 | **一等公民** |
+```typescript
+class AgentTool {
+  async call(input, context): Promise<ToolResult> {
+    // 1. 解析 agent type
+    //    - subagent_type 指定 → 对应 AgentDefinition
+    //    - subagent_type 未指定 → fork 路径或 general-purpose
+    
+    // 2. 守卫检查
+    //    - 递归 fork 检测（isInForkChild）
+    //    - team 限制
+    //    - MCP server 要求
+    
+    // 3. 异步/同步分支
+    if (shouldRunAsync) {
+      registerAsyncAgent(agentId, ...)
+      return { status: 'async_launched', agentId }
+    }
+    
+    // 4. 前台执行
+    for await (const progress of runAgent(agentId, ...)) {
+      trackProgress(progress)  // 可选的 onProgress 回调
+    }
+    
+    // 5. 结果组装
+    return finalizeAgentTool(agentId, messages)
+  }
+}
+```
+
+**Agent 类型注册**（声明式 `AgentDefinition`）：
+
+```typescript
+type AgentDefinition = {
+  name: string
+  description: string
+  systemPrompt?: string | SystemPromptProducer
+  tools?: string[]           // 白名单，'*' = 全部
+  excludeTools?: string[]    // 黑名单
+  model?: string | ModelDefinition
+  permissionMode?: 'bubble' | 'restricted'
+  supportsIsolation?: boolean
+  cwd?: string
+}
+```
+
+内置类型按权限模式分三类：
+- **General-purpose**（默认）：inherit 权限，完整工具集
+- **Explore**：受限只读工具（Read/Search/Glob/Grep）
+- **Plan**：规划工具 + 只读工具
+
+**Fork 路径**（`forkSubagent.ts`）：
+
+```typescript
+function isForkSubagentEnabled(): boolean {
+  // 检查 feature flag + coordinator mode + interactive session
+}
+
+function buildForkedMessages(
+  directive: string,
+  assistantMessage: AssistantMessage,
+): Message[] {
+  // 克隆 parent 的最后一条 assistant 消息
+  // 插入占位 tool_result（空内容）
+  // 追加 fork 指令块
+  // → 最大化缓存共享（字节级匹配）
+}
+```
+
+### 4.3 任务传递
+
+任务通过 `AgentInput.prompt` 传递，是 subagent 的**第一条 user message**：
+
+```typescript
+// AgentTool input schema
+{
+  description: string    // 任务描述（UI 显示用）
+  prompt: string         // 具体指令（LLM 输入）
+  subagent_type?: string // agent type
+  model?: string         // 模型
+  run_in_background?: boolean
+  name: string           // 唯一标识
+  mode?: string          // 权限模式
+  isolation?: 'worktree' | 'remote'
+  cwd?: string           // 工作目录
+}
+```
+
+**Fork 路径的指令包装**（`forkSubagent.ts:buildChildMessage`）：
+
+```typescript
+// fork 子代理的指令包含:
+const FORK_TAG = 'This is a forked conversation.'
+// + 规则（仅文本输出、不得调用工具/返回 JSON）
+// + XML 输出格式
+```
+
+### 4.4 输入文件/数据传递
+
+**文件传递方式取决于 isolation 参数**：
+
+| 模式 | 行为 |
+|------|------|
+| **默认** | 共享文件系统，subagent 可读写 parent 的 CWD |
+| **worktree** | `EnterWorktree` 创建临时 git worktree，完成后自动清理 |
+| **remote** | 通过 RemoteTrigger API 在独立会话执行 |
+
+对于 `createSubagentContext()`，文件状态传递：
+
+```typescript
+function createSubagentContext(parent: ToolUseContext): ToolUseContext {
+  return {
+    readFileState: clone(parent.readFileState),     // 克隆当前文件缓存
+    abortController: new AbortController(parent),    // 继承 parent（parent 取消 → 子取消）
+    getAppState: wrap(parent.getAppState, {          // 避免权限提示
+      shouldAvoidPermissionPrompts: true,
+    }),
+    setAppState: () => {},                           // 隔离（不修改 parent state）
+    queryTracking: {                                 // 新链
+      chainId: parent.queryTracking.chainId,
+      depth: parent.queryTracking.depth + 1,
+    },
+    agentId, agentType,                              // 标记
+    // 不传递 UI 相关:
+    setInProgressToolUseIDs: () => {},
+    setResponseLength: () => {},
+    addNotification: undefined,
+    setToolJSX: undefined,
+    setSDKStatus: undefined,
+  }
+}
+```
+
+### 4.5 Context 传递
+
+**消息历史：不传递。** Subagent 使用全新的 `mutableMessages` 数组，从空的消息历史开始，只有 prompt 作为第一条 user message。
+
+**System Prompt**：根据 AgentDefinition 整体替换（`buildEffectiveSystemPrompt()`）：
+
+```typescript
+function buildEffectiveSystemPrompt(
+  agentDefinition?: AgentDefinition,
+): string[] {
+  if (agentDefinition?.systemPrompt) {
+    return [agentDefinition.systemPrompt]
+  }
+  return defaultSystemPrompt  // 或 agent type 的默认 prompt
+}
+```
+
+**Fork 路径的特殊处理**（`CacheSafeParams`）：
+
+```typescript
+type CacheSafeParams = {
+  // 这些参数必须与主线程匹配以共享 cache
+  systemPromptParams: SystemPromptParams
+  getUserContextPromise: Promise<UserContext>
+  getSystemContextPromise: Promise<SystemContext>
+  forkContextMessages?: Message[]  // 子 agent 的上下文消息
+}
+```
+
+**Context 传递清单**：
+
+| Context 项 | AgentTool 路径 | Fork 路径 |
+|-----------|---------------|-----------|
+| 消息历史 | ❌ 不传递 | ❌ 不传递（新数组） |
+| System prompt | AgentDefinition 整体替换 | 共享主线程 prompt（字节级匹配） |
+| Prompt | `input.prompt` 直接传递 | `directive` 参数 |
+| 文件缓存 | `readFileState` 克隆 | 共享 |
+| 工具集 | `resolveAgentTools()` 过滤 | `tools` 参数 |
+| 权限 | agent mode / bubble | 继承 |
+| 取消信号 | 新建（继承 parent） | 主线程 controller |
+| Cache | 独立 | CacheSafeParams 共享 |
+| MCP 工具 | subagent 可注册独立 server | N/A |
+| 工作目录 | 共享/可选 worktree | 共享 |
+| 状态 | 隔离 `ToolUseContext` | 隔离 `forkedAgentContext` |
+
+### 4.6 结果回传
+
+**同步模式**（`runAgent()` 生成器）：
+
+```typescript
+async function* runAgent(input, context): AsyncGenerator<AgentProgress> {
+  // 迭代 query() 循环
+  // yield progress 事件（StreamEvent、tool_use、agent_log 等）
+  // 最终 yield finalizeAgentTool() 的完整结果
+  // → 包含全部消息、工具调用数、耗时
+}
+```
+
+**异步模式**（`registerAsyncAgent` + `runAsyncAgentLifecycle`）：
+
+```typescript
+function registerAsyncAgent(
+  agentId: string,
+  description: string,
+  context: ToolUseContext,
+): void {
+  // 1. 注册到 appState.tasks
+  // 2. dispatchEvent('async_agent_registered')
+  // 3. Parent 可通过 TaskGet/TaskList 查询状态
+}
+```
+
+**AgentTool 结果结构**（`finalizeAgentTool`）：
+
+```typescript
+{
+  messages: Message[],           // 完整消息历史
+  totalToolCalls: number,
+  durationMs: number,
+  output: string,                // 最终回复文本
+  // 异步:
+  agentId?: string,
+  status?: 'running' | 'completed' | 'failed',
+}
+```
+
+**Worktree 自动清理**：`isolation: 'worktree'` 的任务完成后，自动 `ExitWorktree`，可选择 keep/remove worktree。
+
+### 4.7 Workspace/Session 隔离
+
+| 维度 | 实现 |
+|-----|------|
+| **Session 隔离** | ✅ 全新 `mutableMessages[]` + `sidechain transcript` |
+| **文件系统隔离** | ⚠️ 默认共享，可选 `isolation: 'worktree'` |
+| **进程隔离** | ❌ 同进程（但 `runAsyncAgentLifecycle` 可创建独立进程） |
+| **工具隔离** | ✅ `resolveAgentTools()` 按 AgentDefinition 过滤 |
+| **MCP 隔离** | ✅ subagent 可注册独立 MCP server（additive） |
+| **取消传播** | ✅ parent 取消 → subagent 的 AbortController 自动触发 |
+| **嵌套限制** | ⚠️ ALL_AGENT_DISALLOWED_TOOLS 排除 AgentTool（禁止递归），但 fork 路径无限制 |
+
+### 4.8 Claude Code 的关键设计点
+
+1. **两种 subagent 路径**：AgentTool（用户触发的独立 agent）+ Forked Agent（系统内部子任务，缓存共享）。不同于前三家的单一模式。
+
+2. **Fork 路径的缓存优化**：`CacheSafeParams` 保证 fork 的 system prompt + user context + system context 与主线程字节级一致，最大化 prompt cache 命中。
+
+3. **AgentDefinition 声明式**：用声明式 YAML 定义 agent type 的工具集、prompt、permission mode。比白名单/黑名单更灵活。
+
+4. **权限模式 `bubble`**：subagent 的权限决策可以"冒泡"到 parent（借用 parent 的已批准权限），避免重复询问。
+
+5. **创建独立 MCP server 的能力**：subagent 可以注册自己的 MCP 工具，在任务完成后自动清理，不影响 parent 的 MCP 连接。
 
 ---
 
-## 五、输入传递机制详解
+## 五、综合对比
+
+### 5.1 调度机制对比
+
+| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** | **Agenda 目标** |
+|-----|-----------|-----------|----------|-----------------|----------------|
+| **调度粒度** | 独立 daemon 进程 | 独立 OS 线程 | 同进程 async task | **同进程 async + 可选 worktree** | 同进程 async（轻量） |
+| **触发方式** | `subagent_new` tool | `Agent` tool | `Agent` tool | **AgentTool + runForkedAgent()** | `agenda()` 函数（普通函数调用） |
+| **阻塞方式** | 同步/后台 | 仅后台（线程） | 前台/后台 | **前台/后台 + async generator 进度** | 前台（await） |
+| **生命周期** | manifest + watcher | 线程启动/结束 | async task | **query() 循环调用/返回** | 函数调用/返回 |
+| **缓存策略** | 无 | 无 | 无 | **forkedAgent 共享 cache + 独立 cache 双路径** | 无 |
+
+### 5.2 Context 传递对比
+
+| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** | **Agenda 目标** |
+|-----|-----------|-----------|----------|-----------------|----------------|
+| **消息历史** | ❌ 不传递 | ❌ 不传递 | ❌ 不传递 | **❌ 不传递（全新 mutableMessages[]）** | ❌ 不传递（显式 inputs） |
+| **System prompt** | 复制 system.md | 重建 | 从 spec 加载 | **AgentDefinition 整体替换 / CacheSafeParams 共享** | Agent Loop 统一（不区分 main/sub） |
+| **环境变量** | `BUTTERFLY_SESSION_ID` | 共享进程环境 | 共享 `builtin_args` | **通过 ToolUseContext 传递** | 通过 `inputs` 显式传递 |
+| **文件访问** | Symlink 读父目录 | 共享文件系统 | 共享文件系统 | **默认共享，可选 worktree 隔离** | `dep_inputs` 路由 + Workspace 隔离 |
+| **工具限制** | Guardian + mode | 白名单 | `tool_policy` allowlist | **AgentDefinition.tools + excludeTools 声明式** | 无限制（`agenda()` 就是普通 tool） |
+
+### 5.3 结果回传对比
+
+| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** | **Agenda 目标** |
+|-----|-----------|-----------|----------|-----------------|----------------|
+| **回传方式** | 轮询 context.jsonl | 写入文件 | 提取最后消息 | **完整消息 + 产物结构化 + onProgress 生成器** | `output/` 目录 + `dep_inputs` |
+| **结构化** | 纯文本（8000字截断） | 纯文本（markdown） | 纯文本 | **ContentBlock[] + 工具调用计数 + 耗时** | 文件产物（任意格式） |
+| **自动注入** | ✅ 后台模式自动注入 | ❌ 需主动读取 | ✅ Foreground 自动返回 | ✅ **Generator yield + async agent query** | ✅ `dep_inputs` 自动路由 |
+
+### 5.4 隔离与限制对比
+
+| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** | **Agenda 目标** |
+|-----|-----------|-----------|----------|-----------------|----------------|
+| **Workspace 隔离** | ✅ 完整目录隔离 | ❌ 无隔离 | ❌ 共享目录 | **⚡ 默认共享，可选 worktree 隔离** | ✅ 独立 workspace |
+| **Session 隔离** | ✅ 独立 context.jsonl | ✅ 独立 Session | ✅ 独立 context.jsonl | **✅ 独立 mutableMessages + sidechain transcript** | ✅ 独立 session |
+| **进程隔离** | ✅ 独立 daemon | ✅ 独立线程 | ❌ 同进程 | **❌ 同进程（async generator 内）** | ❌ 同进程（轻量） |
+| **嵌套深度** | `MAX_DEPTH = 2` | 禁止（白名单） | 禁止（role 检查） | **⚠️ AgentTool 禁止递归，fork 路径无限制** | `MAX_DEPTH` 软限制 |
+| **Subagent 等级** | 二等公民 | 二等公民 | 二等公民 | **⚡ 双路径：AgentTool（二等）+ Fork（一等）** | **一等公民** |
+
+---
+
+## 六、输入传递机制详解
 
 本章节专门分析三个库在启动 subagent 时，**输入（文件/数据）、任务、context 的具体传递机制**。这是 Agenda `inputs` 参数设计的核心参考。
 
-### 5.1 Butterfly Agent 的输入传递
+### 6.1 Butterfly Agent 的输入传递
 
 **任务传递：**
 
@@ -671,7 +958,7 @@ shutil.copy2(mode_src, core_dir / "mode.md")
 
 ---
 
-### 5.2 Claw Code 的输入传递
+### 6.2 Claw Code 的输入传递
 
 **任务传递：**
 
@@ -716,7 +1003,7 @@ fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOu
 
 ---
 
-### 5.3 Kimi CLI 的输入传递
+### 6.3 Kimi CLI 的输入传递
 
 **任务传递：**
 
@@ -773,61 +1060,130 @@ async def prepare_soul(spec: SubagentRunSpec, runtime: Runtime, ...):
 
 ---
 
-### 5.4 共同模式总结
+### 6.4 Claude Code 的输入传递
 
-| 维度 | Butterfly | Claw Code | Kimi CLI | 模式 |
-|-----|-----------|-----------|----------|------|
-| **消息历史** | ❌ 不传递 | ❌ 不传递 | ❌ 不传递 | **共识：子 agent 不继承 parent 对话** |
-| **任务传递** | `initial_message` → context.jsonl | `prompt` → AgentJob | `prompt` → spec | 都通过参数直接传递 |
-| **文件传递** | 复制 + symlink | 无（共享目录） | 无（共享目录） | Butterfly 最复杂，其他两家共享 |
-| **System prompt** | 复制 system.md | 重建 | 从 spec 加载 | 都不直接继承 parent |
-| **环境变量** | `BUTTERFLY_SESSION_ID` | 共享进程环境 | 共享 `builtin_args` | 各不相同 |
-| **Context 规模** | 大量文件复制 | 最小（仅 prompt） | 中等（共享 runtime 引用） | Butterfly 最重，Claw 最轻 |
+**任务传递：**
+
+任务通过 `AgentInput.prompt` 传递，是 subagent 的**第一条 user message**：
+
+```typescript
+// AgentTool input schema
+{
+  description: string    // 任务描述（UI 显示用）
+  prompt: string         // 具体指令（LLM 输入）
+  subagent_type?: string // agent type
+  model?: string         // 模型
+  run_in_background?: boolean
+  name: string           // 唯一标识
+  mode?: string          // 权限模式
+  isolation?: 'worktree' | 'remote'
+  cwd?: string           // 工作目录
+}
+```
+
+**文件/数据输入传递：**
+
+| 传递模式 | 行为 | 适用场景 |
+|---------|------|---------|
+| **共享文件系统** | subagent 可直接读写 parent 的 CWD | 默认，快速任务 |
+| **worktree 隔离** | `EnterWorktree` 创建临时 git worktree，完成后自动清理 | 不影响主分支的任务 |
+| **remote** | 通过 RemoteTrigger API 在独立会话执行 | 长时间运行的任务 |
+
+对于 `createSubagentContext()`，通过克隆 `readFileState` 传递文件缓存状态。
+
+**Fork 路径的输入传递**（`CacheSafeParams`）：
+
+```typescript
+type CacheSafeParams = {
+  systemPromptParams: SystemPromptParams    // 字节级匹配主线程 cache key
+  getUserContextPromise: Promise<UserContext>
+  getSystemContextPromise: Promise<SystemContext>
+  forkContextMessages?: Message[]           // 子 agent 上下文消息
+}
+```
+
+Fork 路径可传递部分上下文消息（不含历史对话，仅包含当前的 directive）。
+
+**Context 传递完整清单：**
+
+| Context 项 | AgentTool 路径 | Fork 路径 |
+|-----------|---------------|-----------|
+| 消息历史 | ❌ 不传递（全新 `mutableMessages[]`） | ⚠️ `forkContextMessages` 传递上下文 |
+| System prompt | AgentDefinition 整体替换 | 共享主线程 prompt（字节级匹配） |
+| Prompt | `input.prompt` | `directive` 参数 |
+| 文件缓存 | `readFileState` 克隆 | 共享 |
+| 工具集 | `resolveAgentTools()` 过滤 | `tools` 参数 |
+| 权限 | agent mode / bubble / restricted | 继承 parent |
+| 取消 | 新建 AbortController（继承 parent） | 主线程 controller |
+| 缓存 | 独立 | CacheSafeParams 共享 |
+| MCP | 可注册独立 server | N/A |
+| 工作目录 | 共享 / worktree 隔离 | 共享 |
+| 状态 | ToolUseContext 隔离 | forkedAgentContext |
+
+### 6.5 共同模式总结
+
+| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** | 模式 |
+|-----|-----------|-----------|----------|-----------------|------|
+| **消息历史** | ❌ 不传递 | ❌ 不传递 | ❌ 不传递 | **❌ 不传递 / forkContextMessages 有限传递** | **共识：子 agent 不继承 parent 对话历史** |
+| **任务传递** | `initial_message` → context.jsonl | `prompt` → AgentJob | `prompt` → spec | **`prompt` → AgentTool input / `directive` → fork** | 都通过参数直接传递 |
+| **文件传递** | 复制 + symlink | 无（共享目录） | 无（共享目录） | **共享 / worktree / remote 三种模式** | Butterfly 最复杂，其他共享 |
+| **System prompt** | 复制 system.md | 重建 | 从 spec 加载 | **AgentDefinition 替换 / 共享主线程（fork）** | 都不直接继承 parent |
+| **环境变量** | `BUTTERFLY_SESSION_ID` | 共享进程环境 | 共享 `builtin_args` | **ToolUseContext 透传** | 各不相同 |
+| **缓存共享** | 无 | 无 | 无 | **fork 路径字节级匹配主线程 cache** | Claude Code 独有 |
+| **Context 规模** | 大量文件复制 | 最小（仅 prompt） | 中等（共享 runtime 引用） | **中等（ToolUseContext 克隆 + CacheSafeParams）** | Butterfly 最重，Claw 最轻 |
 
 ---
 
-## 六、对 Agenda DAG 层设计的启示
+## 七、对 Agenda DAG 层设计的启示
 
-### 6.1 必须避免的设计
+### 7.1 必须避免的设计
 
 1. **不要特殊的 subagent API**
-   - Butterfly 的 `subagent_new`、Claw 的 `Agent` tool、Kimi 的 `Agent` tool 都是特殊入口
+   - Butterfly 的 `subagent_new`、Claw 的 `Agent` tool、Kimi 的 `Agent` tool、Claude Code 的 AgentTool 都是特殊入口
    - Agenda：`agenda()` 就是普通函数，Agent Loop 调用它和调用 `read_file` 没有区别
 
 2. **不要 role/身份区分**
    - Kimi 的 `role != "root"` 检查明确禁止嵌套
+   - Claude Code 的 ALL_AGENT_DISALLOWED_TOOLS 也排除 AgentTool
    - Agenda：没有 main/sub 之分，所有 Agent 共享同一个 AgentLoop
 
 3. **不要工具白名单限制递归**
-   - Claw 的 `allowed_tools_for_subagent()` 排除 `Agent` 工具
+   - Claw 的 `allowed_tools_for_subagent()`、Claude Code 的 `ALL_AGENT_DISALLOWED_TOOLS` 都排除 Agent 工具
    - Agenda：`agenda()` 在工具集中可用，Agent 可自由调用
 
 4. **不要复杂的文件 seeding**
    - Butterfly 复制大量文件（system/task/env/skills/memory/tools/config/mode）
    - Agenda：通过 `inputs` 参数显式传递，不自动复制
 
-### 6.2 应该借鉴的设计
+### 7.2 应该借鉴的设计
 
-1. **Workspace 隔离（学 Butterfly）**
+1. **Workspace 隔离（学 Butterfly + Claude Code worktree）**
    - 每个 `agenda()` 调用创建独立 workspace
-   - 通过 `dep_inputs` / symlink 读取父目录产物
-   - Guardian 防止写入父目录
+   - Claude Code 的可选 `isolation: 'worktree'` 提供了灵活度
+   - Agenda：默认 workspace 隔离 + 可选共享模式
 
-2. **Context 不自动继承（学三家）**
+2. **Context 不自动继承（学四家）**
    - 子 agent 不自动继承 parent 的消息历史
    - 通过 `inputs` 参数显式传递上下文
    - 避免 context 污染
 
-3. **结构化产物回传（改进三家）**
+3. **结构化产物回传（改进四家 + 学 Claude Code）**
    - Butterfly/Claw/Kimi 都是"提取最终文本"
+   - Claude Code 的 ContentBlock[] + 工具调用计数 + 耗时结构化更丰富
    - Agenda：通过 `output/` 目录产出文件，`dep_inputs` 结构化路由
 
-4. **同进程轻量调度（学 Kimi）**
+4. **同进程轻量调度（学 Kimi + Claude Code）**
    - Butterfly 的独立 daemon 太重
    - Claw 的独立线程也不错但 Rust 特有
-   - Kimi 的 `asyncio.create_task()` 最轻量，Python 友好
+   - Kimi 的 `asyncio.create_task()` + Claude Code 的 async generator 最轻量
+   - Agenda：同进程 async，支持进度回调
 
-### 6.3 Agenda 的 `inputs` 设计草案
+5. **Context 对象隔离（学 Claude Code ToolUseContext）**
+   - Claude Code 通过 `createSubagentContext()` 创建隔离上下文
+   - 非全局变量，显式参数传递
+   - Agenda：Session 作为上下文容器
+
+### 7.3 Agenda 的 `inputs` 设计草案
 
 基于以上调研，Agenda 的输入传递应该：
 
@@ -846,59 +1202,26 @@ class Inputs:
 
 | 决策 | 来源 | 说明 |
 |-----|------|------|
-| ❌ 不传递消息历史 | 三家共识 | 避免 context 污染和 token 爆炸 |
+| ❌ 不传递消息历史 | 四家共识 | 避免 context 污染和 token 爆炸 |
 | ❌ 不自动复制大量文件 | 反对 Butterfly | 通过 `files` 显式指定 |
 | ✅ 通过 `dep_inputs` 路由文件 | 改进 Butterfly symlink | 结构化、可验证 |
 | ✅ System prompt 统一 | Agenda 创新 | Agent Loop 不分 main/sub |
 | ✅ 产物通过 `output/` 目录传递 | 改进"提取文本" | 支持任意格式 |
-| ✅ 同进程 async 调度 | 学 Kimi | 轻量、Python 友好 |
+| ✅ 同进程 async 调度 | 学 Kimi + Claude Code | 轻量、Python 友好 |
+| ✅ Context 对象显式传递 | 学 Claude Code | Session 参数，非全局变量 |
+| ✅ 异步进度回调 | 学 Claude Code | 可选的 on_progress 生成器 |
 
-### 5.1 必须避免的设计
-
-1. **不要特殊的 subagent API**
-   - Butterfly 的 `subagent_new`、Claw 的 `Agent` tool、Kimi 的 `Agent` tool 都是特殊入口
-   - Agenda：`agenda()` 就是普通函数，Agent Loop 调用它和调用 `read_file` 没有区别
-
-2. **不要 role/身份区分**
-   - Kimi 的 `role != "root"` 检查明确禁止嵌套
-   - Agenda：没有 main/sub 之分，所有 Agent 共享同一个 AgentLoop
-
-3. **不要工具白名单限制递归**
-   - Claw 的 `allowed_tools_for_subagent()` 排除 `Agent` 工具
-   - Agenda：`agenda()` 在工具集中可用，Agent 可自由调用
-
-### 5.2 应该借鉴的设计
-
-1. **Workspace 隔离（学 Butterfly）**
-   - 每个 `agenda()` 调用创建独立 workspace
-   - 通过 `dep_inputs` / symlink 读取父目录产物
-   - Guardian 防止写入父目录
-
-2. **Context 不自动继承（学三家）**
-   - 子 agent 不自动继承 parent 的消息历史
-   - 通过 `inputs` 参数显式传递上下文
-   - 避免 context 污染
-
-3. **结构化产物回传（改进三家）**
-   - Butterfly/Claw/Kimi 都是"提取最终文本"
-   - Agenda：通过 `output/` 目录产出文件，`dep_inputs` 结构化路由
-
-4. **同进程轻量调度（学 Kimi）**
-   - Butterfly 的独立 daemon 太重
-   - Claw 的独立线程也不错但 Rust 特有
-   - Kimi 的 `asyncio.create_task()` 最轻量，Python 友好
-
-### 5.3 Agenda DAG 层的实现要求
+### 7.4 Agenda DAG 层的实现要求
 
 基于以上调研，DAG 层需要满足：
 
 | 要求 | 来源 | 实现方式 |
 |-----|------|---------|
 | **Base Case 退化** | design | `len(dag.nodes) == 1` 时跳过 Scheduler |
-| **Workspace 隔离** | Butterfly | 每次 `agenda()` 调用创建独立 workspace |
+| **Workspace 隔离** | Butterfly + Claude Code | 默认独立 workspace，可选共享模式 |
 | **输入路由** | Butterfly symlink | `dep_inputs` 映射父目录产物到子 `input/` |
-| **Context 显式传递** | 三家共识 | `inputs` 参数，不继承消息历史 |
-| **结果结构化回传** | 改进 | `output/` 目录产物，`dep_inputs` 自动路由 |
-| **轻量调度** | Kimi | 同进程 async，非独立 daemon/线程 |
+| **Context 显式传递** | 四家共识 | `inputs` 参数，不继承消息历史 |
+| **结果结构化回传** | 改进 + Claude Code | `output/` 目录产物 + on_progress 回调 |
+| **轻量调度** | Kimi + Claude Code | 同进程 async，非独立 daemon/线程 |
 | **深度限制** | Butterfly | `MAX_DEPTH` 参数，软约束 |
 | **无特殊身份** | Agenda 创新 | 无 `role`、无特殊 tool、无白名单 |

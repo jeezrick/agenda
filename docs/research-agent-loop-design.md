@@ -1,6 +1,6 @@
 # Agent Loop 与 Subagent Loop 设计调研报告
 
-> 调研对象：Butterfly Agent、Claw Code、Kimi CLI
+> 调研对象：Butterfly Agent、Claw Code、Kimi CLI、Claude Code
 > 调研目的：为 Agenda 的 Agent Loop 层设计提供参考，明确"Subagent 一等公民"的实现路径
 
 ---
@@ -207,15 +207,83 @@ else:
 
 ---
 
-### 1.4 Prompt 组装对比总结
+### 1.4 Claude Code
 
-| 维度 | Butterfly | Claw Code | Kimi CLI |
-|-----|-----------|-----------|----------|
-| **模板引擎** | 字符串拼接 | 字符串拼接 | Jinja2 (`${VAR}`) |
-| **Static/Dynamic 分离** | 有 `_build_system_parts()` | 无 | 无 |
-| **Subagent 差异** | mode.md + Agent Collaboration Mode | 固定日期 + 身份声明 | ROLE_ADDITIONAL |
-| **Prompt 缓存** | Anthropic prompt caching | 无 | 无 |
-| **恢复时复用** | 重新加载文件 | 重新构建 | 复用持久化的 prompt |
+**System Prompt 组装流水线**（多阶段，按顺序叠加）：
+
+```
+Stage A: 默认提示           src/constants/prompts.ts:getSystemPrompt()
+   ├─ Intro: "You are Claude Code, Anthropic's official CLI..."
+   ├─ System: 规则、hook、压缩说明
+   ├─ Doing Tasks: 软件工程任务指令
+   ├─ Actions: 可逆/不可逆操作指南
+   ├─ Using Your Tools: 工具使用说明
+   ├─ Tone/Style: 语气风格
+   ├─ Output Efficiency
+   ├─ SYSTEM_PROMPT_DYNAMIC_BOUNDARY  ← 缓存分界标记
+   └─ Dynamic: 记忆、MCP 指令、草稿板等
+
+Stage B: 系统上下文           src/context.ts:getSystemContext()
+   ├─ git status --short
+   ├─ 当前分支、最近 commit、git user
+   └─ cache-breaker 注入
+
+Stage C: 用户上下文           src/context.ts:getUserContext()
+   ├─ CLAUDE.md（项目层次发现）
+   └─ 当前日期
+
+Stage D: API 层前缀          src/services/api/claude.ts
+   ├─ attribution header
+   ├─ CLI sysprompt prefix
+   └─ advisor 指令（如启用）
+
+Stage E: QueryEngine 组装    src/QueryEngine.ts:submitMessage()
+   ├─ fetchSystemPromptParts()（并行获取 A+B+C）
+   ├─ asSystemPrompt([default, memory, append])
+   └─ appendSystemContext + prependUserContext 注入
+```
+
+**关键设计：SYSTEM_PROMPT_DYNAMIC_BOUNDARY**
+
+```typescript
+// src/constants/prompts.ts
+// 当全局缓存作用域启用时，在静态段和动态段之间插入此标记。
+// 所有在标记之前的内容都有机会获得长缓存 TTL。
+// 标记之后的内容在每次会话中变化，不参与缓存。
+const SYSTEM_PROMPT_DYNAMIC_BOUNDARY = `__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__`
+```
+
+**Agent 类型与 Prompt 覆盖**（`src/utils/systemPrompt.ts:buildEffectiveSystemPrompt()`）：
+
+```typescript
+function buildEffectiveSystemPrompt(
+  agentDefinition?: AgentDefinition | undefined,
+): string[] {
+  // 优先级:
+  // 1. overrideSystemPrompt (API)
+  // 2. coordinator prompt
+  // 3. agent prompt (替换默认)
+  // 4. customSystemPrompt
+  // 5. defaultSystemPrompt
+}
+```
+
+几种 agent type 的 prompt 差异：
+- **Explore**: 只读 prompt，固定日期 "2026-03-31"
+- **Plan**: 强调规划输出格式
+- **General-purpose**: 使用默认 prompt
+- **Fork**: 克隆 parent 的完整 system prompt（共享 cache）
+
+### 1.5 Prompt 组装对比总结
+
+| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** |
+|-----|-----------|-----------|----------|-----------------|
+| **模板引擎** | 字符串拼接 | 字符串拼接 | Jinja2 (`${VAR}`) | **多阶段流水线（拼接 + 注入）** |
+| **Static/Dynamic 分离** | `_build_system_parts()` | 无 | 无 | **`SYSTEM_PROMPT_DYNAMIC_BOUNDARY` 标记** |
+| **Subagent 差异** | mode.md + Agent Collaboration Mode | 固定日期 + 身份声明 | ROLE_ADDITIONAL | **AgentDefinition.getSystemPrompt() 整体替换** |
+| **Prompt 缓存** | Anthropic prompt caching | 无 | 无 | **forkedAgent 共享主线程 cache（全缓存复用）** |
+| **恢复时复用** | 重新加载文件 | 重新构建 | 复用持久化的 prompt | **上下文不变，仅切换 query 循环** |
+| **Context 注入时机** | 运行时拼接 | 构建时 | 模板渲染时 | **API 调用时 appendSystemContext + prependUserContext** |
 
 ---
 
@@ -288,18 +356,62 @@ pub fn save_to_path(&self, path) -> Result<(), SessionError> {
 
 ---
 
-### 2.4 Context 管理对比总结
+### 2.4 Claude Code
 
-| 维度 | Butterfly | Claw Code | Kimi CLI |
-|-----|-----------|-----------|----------|
-| **存储格式** | JSON Lines | JSON Lines | JSON Lines |
-| **原子写** | 普通 append | write_atomic | aiofiles append |
-| **日志轮转** | 无 | 256KiB 阈值，3 个归档 | 无 |
-| **Compaction** | 未实现 | 保留 4 条，拆 pair 保护 | 保留 2 条，LLM 压缩 |
-| **Auto-compaction** | 无 | 100K tokens | ratio + reserved |
-| **Token 估算** | provider 真实 usage | len/4 | len/4 |
-| **Resume** | _initial_input_offset() | load_from_path() | restore() |
-| **Checkpoint/回滚** | 无 | 无 | revert_to() |
+**存储格式**：与 Anthropic API 一致的 `ContentBlock` 数组，序列化为 session JSONL：
+
+```
+~/.claude/projects/<project>/sessions/<sessionId>/
+  ├── transcript.jsonl       ← 主会话消息（JSONL，含 parentUuid 链）
+  ├── sidechain/              ← 子 Agent 独立转录
+  │   └── <agentId>.jsonl
+  └── metadata.json           ← session 元数据
+```
+
+每条消息包含 `uuid`、`parentUuid`（形成链式结构）、`type`、`message`（含 role/content/usage）。
+
+**消息类型层次**（`src/types/message.ts`）：
+
+```
+Message (union)
+  ├── UserMessage        ← 用户输入
+  ├── AssistantMessage   ← API 回复
+  ├── AttachmentMessage  ← 附件（文件/Skill/Plan/Agent 状态等）
+  ├── SystemMessage      ← 系统提示
+  ├── SystemCompactBoundaryMessage  ← 压缩边界标记
+  ├── ProgressMessage    ← 进度事件（不写入 transcript）
+  ├── TombstoneMessage   ← 已删除消息的占位
+  └── ToolUseSummaryMessage  ← 工具调用的合并摘要
+```
+
+**Compaction**（详细见 `docs/research-context-compaction.md`）：4 层混合策略
+1. Session Memory Compaction — 复用已提取的记忆，零成本
+2. LLM Full Compaction — Claude API 生成结构化 9 章节摘要 + 附件恢复
+3. Microcompact — time-based（清空冷缓存的工具输出） + cached（cache_edits API 服务端删除）
+4. Reactive Compact — API 413 时被动触发
+
+**Token 估算**：
+```typescript
+// src/services/tokenEstimation.ts
+// 字符数/4 启发式 + content block 类型精确统计
+// 按 block type 分别计算: text → len/4, image → 2000, 
+// tool_result → 递归计算, thinking → len/4
+// 最终 padding * 4/3 保守上浮
+```
+
+### 2.5 Context 管理对比总结
+
+| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** |
+|-----|-----------|-----------|----------|-----------------|
+| **存储格式** | JSON Lines | JSON Lines | JSON Lines | **JSON Lines + parentUuid 链式结构** |
+| **原子写** | 普通 append | write_atomic | aiofiles append | **recordTranscript + flushSessionStorage** |
+| **日志轮转** | 无 | 256KiB 阈值，3 个归档 | 无 | **sidechain 独立，session 无轮转** |
+| **Compaction** | 未实现 | 保留 4 条，拆 pair 保护 | 保留 2 条，LLM 压缩 | **4 层混合（SM + LLM + MC + Reactive）** |
+| **Auto-compaction** | 无 | 100K tokens | ratio + reserved | **contextWindow - 13K tokens + 断路器** |
+| **Token 估算** | provider 真实 usage | len/4 | len/4 | **按 block type 精确估算 + 4/3 padding** |
+| **Resume** | _initial_input_offset() | load_from_path() | restore() | **transcript JSONL 回放** |
+| **Checkpoint/回滚** | 无 | 无 | revert_to() | **无显式 checkpoint** |
+| **消息链** | 无 | 无 | 无 | **parentUuid 形成有向链** |
 
 ---
 
@@ -338,28 +450,100 @@ exclude_tools: [Agent, AskUserQuestion]
 
 ---
 
-### 3.4 Tool 管理对比总结
+### 3.4 Claude Code
 
-| 维度 | Butterfly | Claw Code | Kimi CLI |
-|-----|-----------|-----------|----------|
-| **注册方式** | ToolLoader 动态导入 | GlobalToolRegistry | KimiToolset + importlib |
-| **依赖注入** | 按 name 注入 | 无 | 自动注入 __init__ 参数 |
-| **Subagent 限制** | Guardian (explorer) | 白名单 BTreeSet | allowed_tools + exclude_tools |
-| **禁止递归** | MAX_DEPTH=2 | 白名单排除 Agent | exclude_tools 排除 Agent |
-| **后台执行** | BackgroundTaskManager | 无 | BackgroundTaskManager |
-| **Hook** | 无 | 无 | PreToolUse / PostToolUse |
+**Tool 接口**（`src/Tool.ts`）：
+
+```typescript
+interface Tool<Input, Output, P> {
+  name: string
+  aliases?: string[]
+  searchHint?: string
+  
+  call(args: Input, context: ToolUseContext, canUseTool: CanUseToolFn,
+       parentMessage: ParentMessage, onProgress?: OnProgressFn): Promise<ToolResult<Output>>
+  description(input, options): Promise<string>  // LLM 可见的描述
+  inputSchema: Input                            // Zod schema
+  inputJSONSchema?: ToolInputJSONSchema
+  
+  isEnabled(): boolean
+  isConcurrencySafe(): boolean
+  isReadOnly(): boolean
+  isDestructive(): boolean
+  
+  checkPermissions(input, context): Promise<PermissionResult>
+  validateInput(input, context): Promise<ValidationResult>
+  prompt(options): Promise<string>              // 生成 LLM-facing 工具描述
+}
+```
+
+**注册**：`getAllBaseTools()`（`src/tools.ts:191`）→ `assembleToolPool()`（合并 MCP 工具）
+
+**Schema 生成**（`src/utils/api.ts:toolToAPISchema()`）：
+- `name` → tool.name
+- `description` → tool.prompt()
+- `input_schema` → 从 Zod 或 raw JSON 转换
+- 可选：`strict`、`defer_loading`、`cache_control`、`eager_input_streaming`
+- 结果缓存到 `getToolSchemaCache()`（session-stable）
+
+**调用执行**（`src/query.ts`）：
+- `StreamingToolExecutor` 或 `runTools()` 并行执行工具
+- 结果通过 `mapToolResultToToolResultBlockParam()` 转换为 API 格式
+- 支持 `FILE_UNCHANGED_STUB`（文件未更改时不重复传输）
+
+**Subagent 工具限制**（`src/constants/tools.ts`）：
+
+```typescript
+// 所有 subagent 禁止使用的工具
+const ALL_AGENT_DISALLOWED_TOOLS = [
+  TaskOutput, ExitPlanMode, EnterPlanMode, 
+  AgentTool,  // ← 禁止递归
+  AskUserQuestion, TaskStop, WorkflowTool,
+]
+
+// 异步 agent 允许的工具（只读 + 通用）
+const ASYNC_AGENT_ALLOWED_TOOLS = [
+  Read, Write, Edit, Bash, Search, 
+  Glob, Grep, WebFetch, WebSearch,
+  NotebookEdit, Skill, TodoWrite, ...
+]
+```
+
+由于 Claude Code 使用 agent definition（声明式 YAML）定义每个 agent type 的工具集，限制方式更灵活：
+
+```typescript
+// AgentDefinition 可以声明:
+// - tools: ['Read', 'Write', 'Bash']  ← 白名单
+// - excludeTools: ['AgentTool']         ← 黑名单
+// - tools: ['*']                        ← 全部允许（fork agent）
+```
+
+### 3.5 Tool 管理对比总结
+
+| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** |
+|-----|-----------|-----------|----------|-----------------|
+| **注册方式** | ToolLoader 动态导入 | GlobalToolRegistry | KimiToolset + importlib | **getAllBaseTools() + MCP assembleToolPool()** |
+| **依赖注入** | 按 name 注入 | 无 | 自动注入 __init__ 参数 | **ToolUseContext 参数显式传递** |
+| **Subagent 限制** | Guardian (explorer) | 白名单 BTreeSet | allowed_tools + exclude_tools | **AgentDefinition 声明式 + ALL_AGENT_DISALLOWED_TOOLS** |
+| **禁止递归** | MAX_DEPTH=2 | 白名单排除 Agent | exclude_tools 排除 Agent | **ALL_AGENT_DISALLOWED_TOOLS 排除 AgentTool** |
+| **后台执行** | BackgroundTaskManager | 无 | BackgroundTaskManager | **registerAsyncAgent + runAsyncAgentLifecycle** |
+| **Hook** | 无 | 无 | PreToolUse / PostToolUse | **checkPermissions → PermissionResult（可 HOOK）** |
+| **Schema 缓存** | 无 | 无 | 无 | **getToolSchemaCache() session-stable** |
+| **Streaming** | 无 | 无 | 无 | **StreamingToolExecutor 支持** |
 
 ---
 
 ## 四、唤醒/Reload 对比
 
-| 维度 | Butterfly | Claw Code | Kimi CLI |
-|-----|-----------|-----------|----------|
-| **持久化文件** | context.jsonl | .claw/sessions/<hash>/<id>.jsonl | context.jsonl |
-| **恢复粒度** | turn 级别 | 完整 session | checkpoint 级别 |
-| **隔离** | session ID | workspace fingerprint | subagent ID |
-| **后台任务恢复** | sweep_restart | 无 | background task snapshot |
-| **回滚** | 无 | 无 | revert_to() |
+| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** |
+|-----|-----------|-----------|----------|-----------------|
+| **持久化文件** | context.jsonl | .claw/sessions/<hash>/<id>.jsonl | context.jsonl | **transcript.jsonl + sidechain/<agentId>.jsonl** |
+| **恢复粒度** | turn 级别 | 完整 session | checkpoint 级别 | **消息级别（parentUuid 链式回放）** |
+| **隔离** | session ID | workspace fingerprint | subagent ID | **agentId + sessionId + project 多维** |
+| **后台任务恢复** | sweep_restart | 无 | background task snapshot | **registerAsyncAgent 重新发现** |
+| **回滚** | 无 | 无 | revert_to() | **--resume 命令行 / 无显式 checkpoint** |
+| **Session 元数据** | manifest.json | metadata.json | meta.json | **metadata.json + reAppendSessionMetadata()** |
+| **Fork 恢复** | 无 | 无 | 无 | **CacheSafeParams 缓存复用 + forkContextMessages** |
 
 ---
 
@@ -372,20 +556,23 @@ exclude_tools: [Agent, AskUserQuestion]
 | **Butterfly** | 同一个 Agent 类 | init_session(mode=...) 区分 |
 | **Claw Code** | 同一个 ConversationRuntime<C,T> | 泛型参数不同 |
 | **Kimi CLI** | 同一个 KimiSoul | runtime.role 区分 |
+| **Claude Code** | **同一个 query() 函数** | **隔离通过 ToolUseContext + agentId 实现，代码路径完全相同** |
 
-**关键洞察：三家都使用同一个核心类，通过注入不同的依赖/配置来区分 main/sub。**
+**关键洞察：四家都使用同一个核心类/函数，通过注入不同的依赖/配置来区分 main/sub。** Claude Code 最彻底——subagent 就是调 query()，和主循环无区别。
 
 ### 5.2 Subagent 的特殊限制
 
-| 限制 | Butterfly | Claw Code | Kimi CLI |
-|-----|-----------|-----------|----------|
-| **深度限制** | MAX_DEPTH = 2 | 白名单排除 Agent | role != "root" |
-| **Workspace 隔离** | 完整目录隔离 | 共享文件系统 | 共享 KIMI_WORK_DIR |
-| **消息历史隔离** | 独立 context.jsonl | 独立 Session | 独立 context.jsonl |
-| **Tool 白名单** | Guardian (explorer) | allowed_tools_for_subagent() | allowed_tools + exclude_tools |
-| **结果可见性** | 只能返回 final reply | 写入文件，parent 读取 | 只能返回 summary |
-| **中间步骤可见** | 不可见 | 不可见 | Wire 透传 |
-| **MCP 工具** | 无 | 共享 | 不加载 |
+| 限制 | Butterfly | Claw Code | Kimi CLI | **Claude Code** |
+|-----|-----------|-----------|----------|-----------------|
+| **深度限制** | MAX_DEPTH = 2 | 白名单排除 Agent | role != "root" | **Agent 工具不暴露（ALL_AGENT_DISALLOWED_TOOLS），但 fork 路径无限制** |
+| **Workspace 隔离** | 完整目录隔离 | 共享文件系统 | 共享 KIMI_WORK_DIR | **共享文件系统，可选 worktree 隔离** |
+| **消息历史隔离** | 独立 context.jsonl | 独立 Session | 独立 context.jsonl | **独立 sidechain transcript + createSubagentContext()** |
+| **Tool 白名单** | Guardian (explorer) | allowed_tools_for_subagent() | allowed_tools + exclude_tools | **AgentDefinition.tools + excludeTools 声明式** |
+| **结果可见性** | 只能返回 final reply | 写入文件，parent 读取 | 只能返回 summary | **完整消息 + 产物结构化回传** |
+| **中间步骤可见** | 不可见 | 不可见 | Wire 透传 | **可选的 onProgress 回调** |
+| **MCP 工具** | 无 | 共享 | 不加载 | **subagent 可注册独立 MCP server（additive）** |
+| **Prompt 缓存** | 无 | 无 | 无 | **forkedAgent 字节级缓存共享** |
+| **权限模式** | Guardian | permission_policy | tool_policy | **bubble（继承 parent）/ 独立 / 受限** |
 
 ---
 
@@ -408,18 +595,20 @@ exclude_tools: [Agent, AskUserQuestion]
 
 ### 6.2 应该借鉴的设计
 
-1. **Context 不继承（学三家）**
+1. **Context 不继承（学四家）**
    - 子 agent 不自动继承 parent 的消息历史
    - 通过 inputs 参数显式传递压缩后的上下文
 
-2. **System prompt 统一（改进三家）**
+2. **System prompt 统一（改进四家）**
    - Butterfly 的 mode.md、Claw 的 sub-agent 声明、Kimi 的 ROLE_ADDITIONAL 都是"补丁"
+   - Claude Code 的 AgentDefinition 整体替换，最干净
    - Agenda：同一个 system prompt 模板，不区分 main/sub
 
-3. **Compaction（学 Kimi/Claw）**
+3. **Compaction（学 Kimi + Claude Code）**
    - Butterfly 未实现 compaction
    - Kimi 的 SimpleCompaction + prompts/compact.md 最成熟
-   - Agenda：系统驱动 compaction（已由 Kimi 移植）
+   - Claude Code 的 4 层混合提供了完整的方向指引
+   - Agenda：系统驱动 compaction（从 Kimi 移植，需加工程防护）
 
 4. **Checkpoint/回滚（学 Kimi）**
    - Kimi 的 revert_to() 提供了断点回滚能力
@@ -428,6 +617,15 @@ exclude_tools: [Agent, AskUserQuestion]
 5. **Prompt 模板化（学 Kimi）**
    - Kimi 的 Jinja2 + builtin_args 是最灵活的方案
    - Agenda：Jinja2 system prompt + 环境变量注入
+
+6. **Context 对象隔离（学 Claude Code）**
+   - Claude Code 的 ToolUseContext 是显式参数，非全局变量
+   - subagent 调用 createSubagentContext() 创建隔离上下文
+   - Agenda：Session 作为上下文容器，显式传递
+
+7. **消息链式结构（学 Claude Code）**
+   - Claude Code 的 parentUuid 链支持多级关系追踪
+   - Agenda：通过 parentUuid 链追踪消息来源
 
 ### 6.3 Agenda Agent Loop 的设计草案
 
@@ -463,10 +661,11 @@ class AgentLoop:
 
 | 决策 | 来源 | 说明 |
 |-----|------|------|
-| 同一个 AgentLoop 类 | 三家共识 | 无 special class/role/mode |
+| 同一个 AgentLoop 类 | 四家共识 | 无 special class/role/mode |
 | 无 tool 白名单 | Agenda 创新 | agenda() 在 toolset 中可用 |
-| Context 不继承 | 三家共识 | 通过 inputs 显式传递 |
-| System prompt 统一 | 改进三家 | 同一个 Jinja2 模板 |
+| Context 不继承 | 四家共识 | 通过 inputs 显式传递 |
+| System prompt 统一 | 改进四家 | 同一个 Jinja2 模板 |
 | 系统驱动 Compaction | 学 Kimi | SimpleCompaction + compact.md |
-| 产物通过 output/ 传递 | 改进三家 | 结构化文件，非文本提取 |
+| 产物通过 output/ 传递 | 改进四家 | 结构化文件，非文本提取 |
 | 同进程 async | 学 Kimi | 轻量、Python 友好 |
+| 隔离通过上下文对象 | 学 Claude Code | Session 显式传递，非全局变量 |
