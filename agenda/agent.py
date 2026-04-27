@@ -131,7 +131,27 @@ class AgentLoop:
 
                 # 调用 LLM
                 response = await self._call_llm()
-                msg = response["choices"][0]["message"]
+                choice = response["choices"][0]
+                finish_reason = choice.get("finish_reason")
+                if finish_reason == "insufficient_system_resource":
+                    raise RuntimeError("[DeepSeek] 系统推理资源不足，生成被打断")
+
+                # 记录 usage（prompt cache、reasoning tokens 等）
+                usage = response.get("usage")
+                if usage:
+                    cache_info = ""
+                    if "prompt_cache_hit_tokens" in usage:
+                        hit = usage["prompt_cache_hit_tokens"]
+                        miss = usage.get("prompt_cache_miss_tokens", 0)
+                        cache_info = f" cache_hit={hit} miss={miss}"
+                    if "completion_tokens_details" in usage:
+                        details = usage["completion_tokens_details"]
+                        if details and "reasoning_tokens" in details:
+                            cache_info += f" reasoning={details['reasoning_tokens']}"
+                    if cache_info:
+                        print(f"  [Usage] in={usage.get('prompt_tokens')} out={usage.get('completion_tokens')}{cache_info}")
+
+                msg = choice["message"]
                 msg_dict = self._msg_to_dict(msg)
                 self.messages.append(msg_dict)
 
@@ -251,15 +271,28 @@ class AgentLoop:
     async def _call_llm_with_cfg(self, cfg: Any) -> dict:
         """用指定配置调用 LLM。"""
         client = self._get_client(cfg)
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "model": cfg.model,
             "messages": self.messages,
-            "temperature": 0.6,
+            "temperature": cfg.temperature,
         }
+        if cfg.max_tokens:
+            kwargs["max_tokens"] = cfg.max_tokens
+        if cfg.extra_params:
+            kwargs.update(cfg.extra_params)
         if self.tools._tools:
             kwargs["tools"] = self.tools.schemas()
             kwargs["tool_choice"] = "auto"
-        resp = await client.chat.completions.create(**kwargs)
+
+        # OpenAI SDK 不识别 provider-specific 参数（如 DeepSeek 的 thinking/reasoning_effort），
+        # 需要拆分到 extra_body 中透传。
+        standard_keys = {"model", "messages", "temperature", "max_tokens", "tools", "tool_choice", "stream", "stop", "top_p", "frequency_penalty", "presence_penalty", "logprobs", "top_logprobs", "response_format", "n", "user"}
+        extra_body = {k: v for k, v in kwargs.items() if k not in standard_keys}
+        standard_kwargs = {k: v for k, v in kwargs.items() if k in standard_keys}
+        if extra_body:
+            standard_kwargs["extra_body"] = extra_body
+
+        resp = await client.chat.completions.create(**standard_kwargs)
         return resp.model_dump()
 
     async def _execute_tool(self, tc: dict) -> str:
@@ -373,9 +406,11 @@ class AgentLoop:
         """把 LLM 返回的消息对象转成 dict。"""
         if isinstance(msg, dict):
             return msg
-        d = {"role": getattr(msg, "role", "assistant")}
+        d: dict[str, Any] = {"role": getattr(msg, "role", "assistant")}
         if hasattr(msg, "content") and msg.content:
             d["content"] = msg.content
+        if hasattr(msg, "reasoning_content") and msg.reasoning_content:
+            d["reasoning_content"] = msg.reasoning_content
         if hasattr(msg, "tool_calls") and msg.tool_calls:
             d["tool_calls"] = [tc.model_dump() for tc in msg.tool_calls]
         return d

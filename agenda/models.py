@@ -32,6 +32,9 @@ class ModelConfig:
     provider: str = "openai" # 预留：未来支持非 OpenAI 接口
     fallback_model: str | None = None   # 备用模型名（主模型失败时切换）
     fallback_provider: str | None = None # 备用 provider
+    temperature: float = 1.0 # 采样温度（DeepSeek 建议 Agent 用 1.0）
+    max_tokens: int | None = None  # 最大输出 token 数
+    extra_params: dict | None = None  # provider-specific 参数（如 thinking、reasoning_effort）
 
 
 class ModelRegistry:
@@ -74,6 +77,12 @@ class ModelRegistry:
         for name, cfg in (raw.get("models") or {}).items():
             if not isinstance(cfg, dict):
                 continue
+            # 标准字段
+            standard_fields = {
+                "base_url", "api_key", "model", "token_cap", "provider",
+                "fallback_model", "fallback_provider", "temperature", "max_tokens",
+            }
+            extra = {k: v for k, v in cfg.items() if k not in standard_fields}
             self._models[name] = ModelConfig(
                 name=name,
                 base_url=self._resolve_value(cfg.get("base_url", "")),
@@ -83,6 +92,9 @@ class ModelRegistry:
                 provider=cfg.get("provider", "openai"),
                 fallback_model=cfg.get("fallback_model"),
                 fallback_provider=cfg.get("fallback_provider"),
+                temperature=float(cfg.get("temperature", 1.0)),
+                max_tokens=cfg.get("max_tokens"),
+                extra_params=extra if extra else None,
             )
 
     def _resolve_value(self, value: str) -> str:
@@ -118,6 +130,7 @@ class ModelRegistry:
             api_key=os.environ.get("AGENDA_API_KEY", ""),
             model=os.environ.get("AGENDA_MODEL", "gpt-4"),
             token_cap=32000,
+            temperature=1.0,
         )
 
     def list_models(self) -> list[str]:
