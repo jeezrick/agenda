@@ -19,11 +19,10 @@ except ImportError:
     print("[错误] 需要安装 PyYAML: pip install pyyaml")
     sys.exit(1)
 
-from .const import DEFAULT_MAX_ITERATIONS, DEFAULT_NODE_TIMEOUT, DEFAULT_MAX_RETRIES
+from .const import DEFAULT_MAX_ITERATIONS, DEFAULT_NODE_TIMEOUT, DEFAULT_MAX_RETRIES, MAX_SUB_AGENT_DEPTH
 from .session import Session
 from .models import ModelRegistry
 from .agent import AgentLoop
-from .subagent import SubAgentManager
 from .tools import ToolRegistry, build_tools
 
 
@@ -152,6 +151,8 @@ class DAGScheduler:
 
     def topological_sort(self) -> list[str]:
         """返回拓扑排序后的节点列表。"""
+        from collections import deque
+
         nodes = self.dag.get("nodes", {})
         in_degree = {n: 0 for n in nodes}
         adj = {n: [] for n in nodes}
@@ -161,10 +162,10 @@ class DAGScheduler:
                     adj[dep].append(n)
                     in_degree[n] += 1
 
-        queue = [n for n, d in in_degree.items() if d == 0]
-        result = []
+        queue: deque[str] = deque(n for n, d in in_degree.items() if d == 0)
+        result: list[str] = []
         while queue:
-            n = queue.pop(0)
+            n = queue.popleft()
             result.append(n)
             for m in adj[n]:
                 in_degree[m] -= 1
@@ -185,7 +186,7 @@ class DAGScheduler:
 
     # --- 节点准备 ---
 
-    def prepare_node(self, node_id: str) -> Session:
+    def prepare_node(self, node_id: str, depth: int = 0) -> Session:
         """准备节点目录：复制 inputs、dep_inputs，恢复历史。"""
         config = self.dag["nodes"][node_id]
         node_dir = self.nodes_dir / node_id
@@ -194,6 +195,7 @@ class DAGScheduler:
         # 设置 running 状态
         session.set_state("status", "running")
         session.set_state("started_at", datetime.now().isoformat())
+        session.set_state("agenda_depth", depth)
 
         # 0. 重试时清理旧产物（避免残留干扰）
         done_marker = session.output_dir / "draft.md"
@@ -246,7 +248,7 @@ class DAGScheduler:
 - 按需读取 input/ 下的内容，不要一次性加载所有
 - workspace/ 可放草稿和中间产物
 - 完成后将最终产物写入 output/draft.md
-- 如需创建子 Agent，使用 spawn_child 工具
+- 如需继续分解任务，使用 agenda(dag_yaml) 工具
 """
         session.write_system("hints.md", hints)
         return session
@@ -257,13 +259,26 @@ class DAGScheduler:
         self,
         tools_factory: Callable[[Session], ToolRegistry],
     ) -> dict[str, str]:
-        """运行整个 DAG，返回每个节点的状态。"""
-        max_parallel = self.dag.get("dag", {}).get("max_parallel", 4)
+        """运行整个 DAG，返回每个节点的状态。
+
+        Base Case 优化：单节点 DAG 跳过 Scheduler，直接 AgentLoop.run()。
+        """
         node_ids = list(self.dag.get("nodes", {}).keys())
 
         if not node_ids:
             print("[DAG] 空 DAG，无节点可运行")
             return {}
+
+        # ── Base Case 优化 ──────────────────────────────────────────
+        # 单节点直接走 _run_node，不创建 scheduler state、不调度
+        if len(node_ids) == 1:
+            node_id = node_ids[0]
+            print(f"[DAG] Base Case: 单节点 {node_id}，跳过 Scheduler")
+            await self._run_node(node_id, tools_factory, depth=0)
+            status = "COMPLETED" if self.node_is_done(node_id) else "FAILED"
+            return {node_id: status}
+
+        max_parallel = self.dag.get("dag", {}).get("max_parallel", 4)
 
         # 恢复之前的状态
         self._load_scheduler_state()
@@ -365,7 +380,7 @@ class DAGScheduler:
                 if self._cancelled:
                     break
                 task = asyncio.create_task(
-                    self._run_node(node_id, tools_factory),
+                    self._run_node(node_id, tools_factory, depth=0),
                     name=f"node_{node_id}",
                 )
                 pending_tasks[node_id] = task
@@ -408,82 +423,34 @@ class DAGScheduler:
         """取消整个 DAG 运行。"""
         self._cancelled = True
 
+    def _infer_depth(self, session: Session) -> int:
+        """从 session state 读取当前递归深度。"""
+        return session.get_state("agenda_depth", 0)
+
     async def _run_node(
         self,
         node_id: str,
         tools_factory: Callable[[Session], ToolRegistry],
+        depth: int = 0,
     ) -> None:
         """运行单个节点。"""
+        from .agenda_api import run_agent_node
+
         self.running.add(node_id)
         config = self.dag["nodes"][node_id]
         model_alias = config.get("model")
         print(f"[节点] {node_id} 启动 (模型: {model_alias or 'default'})")
 
         try:
-            session = self.prepare_node(node_id)
+            session = self.prepare_node(node_id, depth=depth)
 
-            tools = tools_factory(session)
-
-            # 注入子 Agent 工具
-            sub_manager = SubAgentManager(session, self.model_registry)
-
-            @tools.register("spawn_child")
-            async def spawn_child(task: str, name: str, model: str | None = None) -> str:
-                """创建子 Agent 执行子任务。name 必须唯一。"""
-                return await sub_manager.spawn_child(task=task, name=name, model=model)
-
-            @tools.register("wait_for_child")
-            async def wait_for_child(name: str, timeout: int = 300) -> str:
-                """等待子 Agent 完成并返回结果。"""
-                return await sub_manager.wait_for_child(name=name, timeout=float(timeout))
-
-            @tools.register("list_children")
-            def list_children() -> str:
-                """列出所有子 Agent。"""
-                return json.dumps(sub_manager.list_children(), ensure_ascii=False)
-
-            # 构建 system prompt
-            hints = session.read_system("hints.md")
-            system_prompt = f"""你是一个智能体，正在执行 DAG 任务。
-
-{hints}
-
-# 可用工具
-你可以调用以下工具来操作文件系统：
-- read_file(path): 读取 input/、workspace/ 或 output/ 下的文件
-  例: read_file("input/book/outline.md")
-- write_file(path, content): 写入 workspace/ 或 output/ 目录
-  例: write_file("workspace/draft.md", "# 草稿...")
-  例: write_file("output/draft.md", "# 最终产物...")
-- list_dir(path): 列出目录内容
-  提示: list_dir(".") 会展示 input/、workspace/、output/ 的概览
-  例: list_dir("input")、list_dir("workspace")、list_dir("output")
-- spawn_child(task, name, model?): 创建子 Agent 执行子任务
-- wait_for_child(name, timeout?): 等待子 Agent 完成
-- list_children(): 列出所有子 Agent
-
-# 工作目录结构
-你的可见范围仅限以下目录：
-  input/      ← 系统输入（大纲、计划、证据、前置章节等），只读
-  workspace/  ← 你的工作区（草稿、笔记、中间产物），可读写
-  output/     ← 最终产物（如 draft.md），可写
-"""
-
-            agent = AgentLoop(
+            await run_agent_node(
                 session=session,
+                node_config=config,
                 model_registry=self.model_registry,
-                tools=tools,
-                model=model_alias,
-                max_iterations=config.get("max_iterations", DEFAULT_MAX_ITERATIONS),
-                timeout=config.get("timeout", DEFAULT_NODE_TIMEOUT),
-                node_id=node_id,
+                tools_factory=tools_factory,
+                depth=depth,
             )
-
-            result = await agent.run(system_prompt, config["prompt"])
-
-            # 写入产物（如果 Agent 没有自己写）
-            if not session.output_exists and result:
-                session.write_file("output/draft.md", result)
 
             session.set_state("status", "completed")
             session.set_state("completed_at", datetime.now().isoformat())
@@ -502,6 +469,25 @@ class DAGScheduler:
 
         finally:
             self.running.discard(node_id)
+
+    @staticmethod
+    def _render_system_prompt(hints: str, tools_description: str) -> str:
+        """用 Jinja2 模板渲染 system prompt。
+
+        模板位置: agenda/prompts/system.md
+        """
+        from jinja2 import Environment, FileSystemLoader, StrictUndefined
+
+        tpl_dir = Path(__file__).parent / "prompts"
+        env = Environment(
+            loader=FileSystemLoader(str(tpl_dir)),
+            undefined=StrictUndefined,
+        )
+        template = env.get_template("system.md")
+        return template.render(
+            hints=hints,
+            tools_description=tools_description,
+        )
 
     def _copy_input(self, src_pattern: str, dst_dir: Path, dst_rel: str | None = None) -> None:
         """复制 input 文件到节点 context。支持 #section 锚点。

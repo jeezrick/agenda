@@ -48,6 +48,25 @@ class ToolRegistry:
             })
         return schemas
 
+    def describe(self) -> str:
+        """生成 LLM 可见的纯文本工具描述列表。"""
+        lines: list[str] = []
+        for name, func in sorted(self._tools.items()):
+            doc = (func.__doc__ or "").strip()
+            sig = self._infer_schema(func)
+            params = sig.get("properties", {})
+            param_strs = []
+            for pname, pschema in params.items():
+                ptype = pschema.get("type", "string")
+                pdefault = pschema.get("default")
+                if pdefault is not None:
+                    param_strs.append(f"{ptype} {pname}={pdefault}")
+                else:
+                    param_strs.append(f"{ptype} {pname}")
+            sig_str = f"({', '.join(param_strs)})" if param_strs else "()"
+            lines.append(f"- {name}{sig_str}: {doc}")
+        return "\n".join(lines)
+
     @staticmethod
     def _infer_schema(func: ToolFunc) -> dict:
         """从函数签名简单推断 JSON Schema（支持常见类型标注）。"""

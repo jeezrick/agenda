@@ -9,10 +9,17 @@
 - AI 自压缩记忆
 - 子 Agent 嵌套
 
-依赖：标准库 + pyyaml + openai
+核心 API:
+    asyncio.run(agenda(dag_spec, workspace))
+
+依赖：标准库 + pyyaml + jinja2 + openai
 """
 
 __version__ = "0.0.6"
+
+import asyncio
+from pathlib import Path
+from typing import Any
 
 from .const import (
     EXIT_SUCCESS,
@@ -26,10 +33,63 @@ from .guardian import Guardian
 from .session import Session
 from .tools import ToolRegistry, build_tools
 from .agent import AgentLoop
-from .subagent import SubAgentManager
 from .scheduler import DAGScheduler
 from .daemon import NodeWatcher
 from .cli import cli
+
+
+async def agenda(
+    dag_spec: dict,
+    workspace: Path | str,
+    inputs: dict | None = None,
+    *,
+    model_registry: ModelRegistry | None = None,
+    tools_factory: Any = None,
+) -> dict[str, str]:
+    """统一入口：执行 DAG，自动退化 Base Case。
+
+    这是 Agenda 的核心函数。对 Agent 来说，调用 agenda() 和调用 read_file()
+    没有区别——它就是一个普通工具。
+
+    Base Case: 单节点 → 直接 AgentLoop.run()，零调度开销。
+    Recursive Step: 多节点 → Scheduler.run() 并行调度。
+
+    Args:
+        dag_spec: DAG 定义字典（同 dag.yaml 解析后的结构）
+        workspace: 工作目录路径
+        inputs: 可选输入参数（预留）
+        model_registry: 模型注册表（默认从 workspace 加载）
+        tools_factory: 工具工厂函数（默认 build_tools）
+
+    Returns:
+        节点状态映射 {node_id: "COMPLETED"|"FAILED"|"PENDING"}
+
+    Example:
+        >>> dag = {
+        ...     "dag": {"name": "example", "max_parallel": 4},
+        ...     "nodes": {
+        ...         "research": {"prompt": "调研..."},
+        ...         "write": {"prompt": "写作...", "deps": ["research"]},
+        ...     },
+        ... }
+        >>> results = asyncio.run(agenda(dag, "/tmp/work"))
+    """
+    from .agenda_api import run_sub_dag
+
+    workspace = Path(workspace)
+    if model_registry is None:
+        model_registry = ModelRegistry().load(workspace)
+    if tools_factory is None:
+        tools_factory = build_tools
+
+    return await run_sub_dag(
+        dag_spec=dag_spec,
+        workspace=workspace,
+        model_registry=model_registry,
+        tools_factory=tools_factory,
+        depth=0,
+    )
+
 
 __all__ = [
     "EXIT_SUCCESS",
@@ -44,8 +104,8 @@ __all__ = [
     "ToolRegistry",
     "build_tools",
     "AgentLoop",
-    "SubAgentManager",
     "DAGScheduler",
     "NodeWatcher",
+    "agenda",
     "cli",
 ]

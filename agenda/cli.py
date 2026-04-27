@@ -196,7 +196,16 @@ def cli() -> int:
             try:
                 scheduler = _load_scheduler(dag_path, models_path)
                 scheduler.dag["dag"]["max_parallel"] = max_parallel
-                results = asyncio.run(scheduler.run(
+
+                # 统一走 agenda() 顶层入口，替代直接 Scheduler.run()
+                # Base Case: 单节点自动退化 AgentLoop.run()
+                # Recursive Step: 多节点走 Scheduler.run()
+                from . import agenda as _agenda
+
+                results = asyncio.run(_agenda(
+                    dag_spec=scheduler.dag,
+                    workspace=scheduler.dag_dir,
+                    model_registry=scheduler.model_registry,
                     tools_factory=lambda session: build_tools(session),
                 ))
                 _json_out({"results": results})

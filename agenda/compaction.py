@@ -18,19 +18,51 @@ CompactionResult = namedtuple("CompactionResult", ["messages", "usage"])
 
 
 def estimate_text_tokens(messages: list[dict]) -> int:
-    """估算消息列表的 token 数。使用字符数 // 4 的启发式方法。"""
-    total_chars = 0
+    """估算消息列表的 token 数。
+
+    改进版启发式（学 Claude Code）：
+    - 英文/ASCII 字符：~4 chars/token
+    - 中文/CJK 字符：~2 chars/token
+    - tool_calls：name + arguments 单独计入
+    - 最终 * 4/3 padding 保守上浮
+
+    如果安装了 tiktoken，优先使用 tiktoken 做精确估算。
+    """
+    try:
+        import tiktoken
+
+        enc = tiktoken.get_encoding("cl100k_base")
+        total = 0
+        for msg in messages:
+            content = msg.get("content") or ""
+            total += len(enc.encode(content))
+            for tc in msg.get("tool_calls", []):
+                func = tc.get("function", {})
+                total += len(enc.encode(func.get("name", "")))
+                total += len(enc.encode(func.get("arguments", "")))
+        return int(total * 4 / 3)  # 保守 padding
+    except Exception:
+        pass
+
+    total_chars_en = 0
+    total_chars_cjk = 0
     for msg in messages:
         content = msg.get("content") or ""
-        total_chars += len(content)
-        # tool_calls 也计入
+        for ch in content:
+            if ord(ch) > 0x4E00 and ord(ch) < 0x9FFF:
+                total_chars_cjk += 1
+            else:
+                total_chars_en += 1
+
+        # tool_calls 按英文估算
         for tc in msg.get("tool_calls", []):
             func = tc.get("function", {})
-            total_chars += len(func.get("name", ""))
-            total_chars += len(func.get("arguments", ""))
-    # ~4 chars per token for English; somewhat underestimates for CJK text,
-    # but this is a temporary estimate that gets corrected on the next LLM call.
-    return total_chars // 4
+            total_chars_en += len(func.get("name", ""))
+            total_chars_en += len(func.get("arguments", ""))
+
+    # 分别估算后合并，再保守上浮
+    raw_estimate = total_chars_en // 4 + total_chars_cjk // 2
+    return int(raw_estimate * 4 / 3)
 
 
 def should_auto_compact(
@@ -53,10 +85,75 @@ def should_auto_compact(
 
 
 class SimpleCompaction:
-    """简单压缩策略：保留最近 N 条 user/assistant 消息，压缩前面的历史。"""
+    """简单压缩策略：保留最近 N 条 user/assistant 消息，压缩前面的历史。
+
+    关键安全保证：不拆散 assistant(tool_use) / tool(tool_result) 对。
+    学 Claw Code + Claude Code 的边界安全设计。
+    """
 
     def __init__(self, max_preserved_messages: int = 2) -> None:
         self.max_preserved_messages = max_preserved_messages
+
+    @staticmethod
+    def _ensure_tool_pair_integrity(history: list[dict], start_index: int) -> int:
+        """调整保留边界，确保不拆分 tool_use/tool_result 对。
+
+        规则：
+        1. 保留区内若有 assistant 带 tool_calls，则所有对应 tool 结果必须在保留区。
+        2. 保留区内若有 tool 结果，则其对应的 assistant 必须在保留区。
+
+        若边界切在不完整的 pair 中间，将边界向前（索引减小）调整到 pair 起始处。
+        """
+        idx = start_index
+        max_iterations = len(history)  # 防止极端情况的死循环
+
+        for _ in range(max_iterations):
+            if idx <= 0:
+                break
+
+            preserved = history[idx:]
+
+            # 收集保留区内 assistant 发出的所有 tool_call ids
+            assistant_tool_ids = set()
+            for msg in preserved:
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    for tc in msg["tool_calls"]:
+                        tc_id = tc.get("id", "")
+                        if tc_id:
+                            assistant_tool_ids.add(tc_id)
+
+            # 收集保留区内所有 tool 结果对应的 ids
+            result_tool_ids = set()
+            for msg in preserved:
+                if msg.get("role") == "tool":
+                    tc_id = msg.get("tool_call_id", "")
+                    if tc_id:
+                        result_tool_ids.add(tc_id)
+
+            # 检查完整性
+            missing_results = assistant_tool_ids - result_tool_ids
+            missing_assistants = result_tool_ids - assistant_tool_ids
+
+            if not missing_results and not missing_assistants:
+                break
+
+            # 向前移动 idx，把缺失部分纳入保留区。
+            # 无论缺失的是结果还是 assistant，都需要找到对应 assistant 的位置
+            #（因为 assistant 一定在 tool 结果之前）。
+            new_idx = idx
+            for i in range(idx - 1, -1, -1):
+                msg = history[i]
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    for tc in msg["tool_calls"]:
+                        tc_id = tc.get("id", "")
+                        if tc_id in missing_results or tc_id in missing_assistants:
+                            new_idx = min(new_idx, i)
+
+            if new_idx >= idx:
+                break
+            idx = new_idx
+
+        return idx
 
     def prepare(
         self, messages: list[dict], *, custom_instruction: str = ""
@@ -84,6 +181,11 @@ class SimpleCompaction:
 
         if n_preserved < self.max_preserved_messages:
             return None, list(messages)
+
+        # 边界安全：不拆散 tool_use/tool_result 对
+        preserve_start_index = self._ensure_tool_pair_integrity(
+            history, preserve_start_index
+        )
 
         to_compact = history[:preserve_start_index]
         to_preserve = history[preserve_start_index:]

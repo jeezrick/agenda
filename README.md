@@ -253,9 +253,21 @@ if len(dag.nodes) == 1:
 
 ---
 
+## 已实现项
+
+1. ✅ **删除 `subagent.py`** — Subagent 没有特殊逻辑，递归通过 Agent 调用 `agenda()` 实现
+2. ✅ **Agent 可调用 `agenda()`** — Agent Loop 里的 Agent 构造子 DAG 后直接调用 `agenda()` 实现递归
+3. ✅ **Base Case 优化** — 单节点 DAG 跳过 Scheduler，直接 `AgentLoop.run()`
+4. ✅ **`agenda()` 顶层函数** — 统一入口，替代当前的直接 Scheduler 调用
+
 ## 待实现项
 
-1. **删除 `subagent.py`** — Subagent 没有特殊逻辑，递归通过 Agent 调用 `agenda()` 实现
-2. **Agent 可调用 `agenda()`** — Agent Loop 里的 Agent 构造子 DAG 后直接调用 `agenda()` 实现递归
-3. **Base Case 优化** — 单节点 DAG 跳过 Scheduler，直接 `AgentLoop.run()`
-4. **`agenda()` 顶层函数** — 统一入口，替代当前的直接 Scheduler 调用
+1. **Checkpoint/回滚** — Kimi CLI 风格的 `revert_to(checkpoint_id)`
+2. **Session Memory Compaction** — Claude Code 风格的零成本压缩（成熟期）
+3. **DAG 动态修改** — 运行时添加/删除节点
+
+## 测试
+
+- **141 个测试全部通过**，覆盖核心运行时（AgentLoop、Scheduler、Session、Guardian、Compaction）
+- CI/CD: GitHub Actions 自动跑 pytest + coverage（Python 3.10/3.11/3.12）
+- 覆盖率: 核心模块 80%+

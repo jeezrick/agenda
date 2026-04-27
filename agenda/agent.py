@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import random
 import re
 import time
 import traceback
@@ -22,6 +23,7 @@ from typing import Any
 
 from .compaction import SimpleCompaction, estimate_text_tokens, should_auto_compact
 from .const import (
+    DEFAULT_COMPACTION_MAX_PRESERVED,
     DEFAULT_COMPACTION_RESERVED,
     DEFAULT_COMPACTION_TRIGGER_RATIO,
     DEFAULT_MAX_ITERATIONS,
@@ -304,29 +306,68 @@ class AgentLoop:
                 self.messages.append(synthetic)
 
     async def _compact_context(self, system_prompt: str) -> None:
-        """系统驱动记忆压缩（学 Kimi Code CLI）。"""
-        compactor = SimpleCompaction(max_preserved_messages=2)
-        compacted = await compactor.compact(
-            self.messages,
-            client=self._get_client(self.model_cfg),
-            model=self.model_cfg.model,
-        )
+        """系统驱动记忆压缩（学 Kimi Code CLI）。
 
-        # 重建 context：rotate 旧文件 → 重写 system prompt → 写入压缩结果
-        backup = self.session.rotate_turns()
-        if backup:
-            print(f"  [压缩] 旧 turns 已 rotate 到 {backup.name}")
+        带指数退避重试（最多 3 次），失败时向上抛出 RuntimeError。
+        """
+        max_retries = 3
+        base_delay = 1.0
+        last_error = None
 
-        self.messages = list(compacted.messages)
-        self.session.clear_turns()
-        self.session.write_system_turn(system_prompt)
-        self.session.save_turn({
-            "type": "turn",
-            "messages": list(self.messages),
-            "compact": True,
-            "ts": datetime.now().isoformat(),
-        })
-        print(f"  [压缩完成] 保留 {len(self.messages)} 条消息")
+        pre_token_count = estimate_text_tokens(self.messages)
+
+        for attempt in range(max_retries):
+            try:
+                compactor = SimpleCompaction(
+                    max_preserved_messages=DEFAULT_COMPACTION_MAX_PRESERVED
+                )
+                compacted = await compactor.compact(
+                    self.messages,
+                    client=self._get_client(self.model_cfg),
+                    model=self.model_cfg.model,
+                )
+
+                # 重建 context：rotate 旧文件 → 重写 system prompt → 写入压缩结果
+                backup = self.session.rotate_turns()
+                if backup:
+                    print(f"  [压缩] 旧 turns 已 rotate 到 {backup.name}")
+
+                self.messages = list(compacted.messages)
+                self.session.clear_turns()
+                self.session.write_system_turn(system_prompt)
+                self.session.save_turn({
+                    "type": "turn",
+                    "messages": list(self.messages),
+                    "compact": True,
+                    "ts": datetime.now().isoformat(),
+                })
+
+                post_token_count = estimate_text_tokens(self.messages)
+                usage_info = ""
+                if compacted.usage:
+                    u = compacted.usage
+                    usage_info = f" (LLM: {u['input']}→{u['output']} tok)"
+                print(
+                    f"  [压缩完成] {pre_token_count} → {post_token_count} tokens"
+                    f"{usage_info}, 保留 {len(self.messages)} 条消息"
+                )
+                return
+
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                    print(
+                        f"  [压缩重试 {attempt + 1}/{max_retries}] "
+                        f"{type(e).__name__}: {e}，{delay:.1f}s 后重试..."
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    break
+
+        raise RuntimeError(
+            f"记忆压缩失败（重试 {max_retries} 次）: {last_error}"
+        ) from last_error
 
     def _msg_to_dict(self, msg: Any) -> dict:
         """把 LLM 返回的消息对象转成 dict。"""
