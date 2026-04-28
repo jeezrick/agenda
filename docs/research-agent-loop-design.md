@@ -440,17 +440,17 @@ Message (union)
 
 ### 2.5 Context 管理对比总结
 
-| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** |
-|-----|-----------|-----------|----------|-----------------|
-| **存储格式** | JSON Lines | JSON Lines | JSON Lines | **JSON Lines + parentUuid 链式结构** |
-| **原子写** | 普通 append | write_atomic | aiofiles append | **recordTranscript + flushSessionStorage** |
-| **日志轮转** | 无 | 256KiB 阈值，3 个归档 | 无 | **sidechain 独立，session 无轮转** |
-| **Compaction** | 未实现 | 保留 4 条，拆 pair 保护 | 保留 2 条，LLM 压缩 | **4 层混合（SM + LLM + MC + Reactive）** |
-| **Auto-compaction** | 无 | 100K tokens | ratio + reserved | **contextWindow - 13K tokens + 断路器** |
-| **Token 估算** | provider 真实 usage | len/4 | len/4 | **按 block type 精确估算 + 4/3 padding** |
-| **Resume** | _initial_input_offset() | load_from_path() | restore() | **transcript JSONL 回放** |
-| **Checkpoint/回滚** | 无 | 无 | revert_to() | **无显式 checkpoint** |
-| **消息链** | 无 | 无 | 无 | **parentUuid 形成有向链** |
+| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** | **Codex** |
+|-----|-----------|-----------|----------|-----------------|-----------|
+| **存储格式** | JSON Lines | JSON Lines | JSON Lines | **JSON Lines + parentUuid 链式结构** | **ContextManager Vec<ResponseItem> + state DB** |
+| **原子写** | 普通 append | write_atomic | aiofiles append | **recordTranscript + flushSessionStorage** | **Mutex<SessionState> + rollouts** |
+| **日志轮转** | 无 | 256KiB 阈值，3 个归档 | 无 | **sidechain 独立，session 无轮转** | **无，通过 rollback 管理** |
+| **Compaction** | 未实现 | 保留 4 条，拆 pair 保护 | 保留 2 条，LLM 压缩 | **4 层混合（SM + LLM + MC + Reactive）** | **LLM 驱动，本地/远程双路径 + 精选用户消息** |
+| **Auto-compaction** | 无 | 100K tokens | ratio + reserved | **contextWindow - 13K tokens + 断路器** | **auto_compact_limit，pre-turn + mid-turn 双触发点** |
+| **Token 估算** | provider 真实 usage | len/4 | len/4 | **按 block type 精确估算 + 4/3 padding** | **approx_token_count 字节启发式 + API usage 追踪** |
+| **Resume** | _initial_input_offset() | load_from_path() | restore() | **transcript JSONL 回放** | **state DB + rollout 重建** |
+| **Checkpoint/回滚** | 无 | 无 | revert_to() | **无显式 checkpoint** | **drop_last_n_user_turns + rollback** |
+| **消息链** | 无 | 无 | 无 | **parentUuid 形成有向链** | **无** |
 
 ---
 
@@ -559,12 +559,12 @@ const ASYNC_AGENT_ALLOWED_TOOLS = [
 
 ### 3.5 Tool 管理对比总结
 
-| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** |
-|-----|-----------|-----------|----------|-----------------|
-| **注册方式** | ToolLoader 动态导入 | GlobalToolRegistry | KimiToolset + importlib | **getAllBaseTools() + MCP assembleToolPool()** |
-| **依赖注入** | 按 name 注入 | 无 | 自动注入 __init__ 参数 | **ToolUseContext 参数显式传递** |
-| **Subagent 限制** | Guardian (explorer) | 白名单 BTreeSet | allowed_tools + exclude_tools | **AgentDefinition 声明式 + ALL_AGENT_DISALLOWED_TOOLS** |
-| **禁止递归** | MAX_DEPTH=2 | 白名单排除 Agent | exclude_tools 排除 Agent | **ALL_AGENT_DISALLOWED_TOOLS 排除 AgentTool** |
+| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** | **Codex** |
+|-----|-----------|-----------|----------|-----------------|-----------|
+| **注册方式** | ToolLoader 动态导入 | GlobalToolRegistry | KimiToolset + importlib | **getAllBaseTools() + MCP assembleToolPool()** | **ToolHandler trait + ToolRouter + ToolOrchestrator** |
+| **依赖注入** | 按 name 注入 | 无 | 自动注入 __init__ 参数 | **ToolUseContext 参数显式传递** | **ToolInvocation { session, turn, payload, call_id }** |
+| **Subagent 限制** | Guardian (explorer) | 白名单 BTreeSet | allowed_tools + exclude_tools | **AgentDefinition 声明式 + ALL_AGENT_DISALLOWED_TOOLS** | **agent_type 角色配置 + depth_limit 防护** |
+| **禁止递归** | MAX_DEPTH=2 | 白名单排除 Agent | exclude_tools 排除 Agent | **ALL_AGENT_DISALLOWED_TOOLS 排除 AgentTool** | **exceeds_thread_spawn_depth_limit 检查** |
 | **后台执行** | BackgroundTaskManager | 无 | BackgroundTaskManager | **registerAsyncAgent + runAsyncAgentLifecycle** |
 | **Hook** | 无 | 无 | PreToolUse / PostToolUse | **checkPermissions → PermissionResult（可 HOOK）** |
 | **Schema 缓存** | 无 | 无 | 无 | **getToolSchemaCache() session-stable** |
@@ -596,22 +596,23 @@ const ASYNC_AGENT_ALLOWED_TOOLS = [
 | **Claw Code** | 同一个 ConversationRuntime<C,T> | 泛型参数不同 |
 | **Kimi CLI** | 同一个 KimiSoul | runtime.role 区分 |
 | **Claude Code** | **同一个 query() 函数** | **隔离通过 ToolUseContext + agentId 实现，代码路径完全相同** |
+| **Codex** | **同一个 Session + TurnContext** | **通过 SessionSource::SubAgent 区分，共享 Session 基础设施** |
 
-**关键洞察：四家都使用同一个核心类/函数，通过注入不同的依赖/配置来区分 main/sub。** Claude Code 最彻底——subagent 就是调 query()，和主循环无区别。
+**关键洞察：五家都使用同一个核心类/函数，通过注入不同的依赖/配置来区分 main/sub。**
 
 ### 5.2 Subagent 的特殊限制
 
-| 限制 | Butterfly | Claw Code | Kimi CLI | **Claude Code** |
-|-----|-----------|-----------|----------|-----------------|
-| **深度限制** | MAX_DEPTH = 2 | 白名单排除 Agent | role != "root" | **Agent 工具不暴露（ALL_AGENT_DISALLOWED_TOOLS），但 fork 路径无限制** |
-| **Workspace 隔离** | 完整目录隔离 | 共享文件系统 | 共享 KIMI_WORK_DIR | **共享文件系统，可选 worktree 隔离** |
-| **消息历史隔离** | 独立 context.jsonl | 独立 Session | 独立 context.jsonl | **独立 sidechain transcript + createSubagentContext()** |
-| **Tool 白名单** | Guardian (explorer) | allowed_tools_for_subagent() | allowed_tools + exclude_tools | **AgentDefinition.tools + excludeTools 声明式** |
-| **结果可见性** | 只能返回 final reply | 写入文件，parent 读取 | 只能返回 summary | **完整消息 + 产物结构化回传** |
-| **中间步骤可见** | 不可见 | 不可见 | Wire 透传 | **可选的 onProgress 回调** |
-| **MCP 工具** | 无 | 共享 | 不加载 | **subagent 可注册独立 MCP server（additive）** |
-| **Prompt 缓存** | 无 | 无 | 无 | **forkedAgent 字节级缓存共享** |
-| **权限模式** | Guardian | permission_policy | tool_policy | **bubble（继承 parent）/ 独立 / 受限** |
+| 限制 | Butterfly | Claw Code | Kimi CLI | **Claude Code** | **Codex** |
+|-----|-----------|-----------|----------|-----------------|-----------|
+| **深度限制** | MAX_DEPTH = 2 | 白名单排除 Agent | role != "root" | **Agent 工具不暴露** | **exceeds_thread_spawn_depth_limit + agent_max_depth** |
+| **Workspace 隔离** | 完整目录隔离 | 共享文件系统 | 共享 KIMI_WORK_DIR | **共享文件系统，可选 worktree 隔离** | **共享文件系统，通过 TurnContext.cwd 约束** |
+| **消息历史隔离** | 独立 context.jsonl | 独立 Session | 独立 context.jsonl | **独立 sidechain transcript** | **独立 CodexThread + 可选 initial_history** |
+| **Tool 白名单** | Guardian (explorer) | allowed_tools_for_subagent() | allowed_tools + exclude_tools | **AgentDefinition.tools + excludeTools 声明式** | **agent_type 角色 + apply_role_to_config()** |
+| **结果可见性** | 只能返回 final reply | 写入文件，parent 读取 | 只能返回 summary | **完整消息 + 产物结构化回传** | **InterAgentCommunication 消息传递** |
+| **中间步骤可见** | 不可见 | 不可见 | Wire 透传 | **可选的 onProgress 回调** | **事件流 forward_events()** |
+| **MCP 工具** | 无 | 共享 | 不加载 | **subagent 可注册独立 MCP server** | **继承 parent 的 MCP connection manager** |
+| **权限模式** | Guardian | permission_policy | tool_policy | **bubble（继承 parent）/ 独立 / 受限** | **审批路由到 parent session** |
+| **Fork 模式** | 无 | 无 | 无 | **forkedAgent cache 共享** | **SpawnAgentForkMode: None / FullHistory / LastNTurns** |
 
 ---
 
@@ -621,49 +622,51 @@ const ASYNC_AGENT_ALLOWED_TOOLS = [
 
 1. **不要特殊的 subagent 类/运行时**
    - Butterfly 的 mode.md、Claw 的 SubagentToolExecutor、Kimi 的 role="subagent" 都是特殊化
+   - Codex 的 SessionSource::SubAgent 也是通过枚举区分，但执行路径相同
    - Agenda：同一个 AgentLoop 类，无 mode/role/特殊 executor
 
 2. **不要 tool 白名单限制递归**
    - Claw 的 allowed_tools_for_subagent()、Kimi 的 exclude_tools 都排除 Agent
+   - Codex 用 exceeds_thread_spawn_depth_limit 做深度限制，更优雅
    - Agenda：agenda() 就是普通 tool，无限制
 
 3. **不要特殊的结果回传机制**
    - Butterfly 的 [DONE]/[REVIEW]/[BLOCKED]/[ERROR] 前缀
    - Kimi 的 summary continuation
+   - Codex 的 InterAgentCommunication 结构化消息传递值得参考
    - Agenda：产物写入 output/ 目录，结构化传递
 
 ### 6.2 应该借鉴的设计
 
-1. **Context 不继承（学四家）**
+1. **Context 不继承（学五家）**
    - 子 agent 不自动继承 parent 的消息历史
+   - Codex 通过 initial_history: Option<InitialHistory> 显式控制，可选继承
    - 通过 inputs 参数显式传递压缩后的上下文
 
-2. **System prompt 统一（改进四家）**
+2. **System prompt 统一（改进五家）**
    - Butterfly 的 mode.md、Claw 的 sub-agent 声明、Kimi 的 ROLE_ADDITIONAL 都是"补丁"
    - Claude Code 的 AgentDefinition 整体替换，最干净
+   - Codex 的 agent_type 角色配置 + apply_role_to_config() 实现组件化
    - Agenda：同一个 system prompt 模板，不区分 main/sub
 
-3. **Compaction（学 Kimi + Claude Code）**
+3. **Compaction（学 Kimi + Claude Code + Codex）**
    - Butterfly 未实现 compaction
-   - Kimi 的 SimpleCompaction + prompts/compact.md 最成熟
-   - Claude Code 的 4 层混合提供了完整的方向指引
+   - Codex 的远程压缩 + 精选用户消息保留 + 逐步裁剪重试值得参考
    - Agenda：系统驱动 compaction（从 Kimi 移植，需加工程防护）
 
-4. **Checkpoint/回滚（学 Kimi）**
+4. **Checkpoint/回滚（学 Kimi + Codex）**
    - Kimi 的 revert_to() 提供了断点回滚能力
+   - Codex 的 drop_last_n_user_turns + history_version 提供了精细的历史管理
    - Agenda 可借鉴用于错误恢复
 
-5. **Prompt 模板化（学 Kimi）**
-   - Kimi 的 Jinja2 + builtin_args 是最灵活的方案
-   - Agenda：Jinja2 system prompt + 环境变量注入
-
-6. **Context 对象隔离（学 Claude Code）**
+5. **Prompt 结构化（学 Codex + Claude Code）**
+   - Codex 的 Prompt struct（非字符串拼接）是最类型安全的方式
    - Claude Code 的 ToolUseContext 是显式参数，非全局变量
-   - subagent 调用 createSubagentContext() 创建隔离上下文
    - Agenda：Session 作为上下文容器，显式传递
 
-7. **消息链式结构（学 Claude Code）**
+6. **消息链式结构（学 Claude Code）**
    - Claude Code 的 parentUuid 链支持多级关系追踪
+   - Codex 的 SessionSource::SubAgent(subagent_source) 也记录了 spawn 关系
    - Agenda：通过 parentUuid 链追踪消息来源
 
 ### 6.3 Agenda Agent Loop 的设计草案
