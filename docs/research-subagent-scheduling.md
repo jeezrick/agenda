@@ -1,6 +1,6 @@
 # Subagent 调度机制调研报告
 
-> 调研对象：Butterfly Agent、Claw Code、Kimi CLI、Claude Code  
+> 调研对象：Butterfly Agent、Claw Code、Kimi CLI、Claude Code、Codex  
 > 调研目的：为 Agenda 的 DAG 层设计提供参考，明确"Subagent 一等公民"的实现路径
 
 ---
@@ -834,53 +834,204 @@ function registerAsyncAgent(
 
 ---
 
-## 五、综合对比
+## 五、Codex
 
-### 5.1 调度机制对比
+### 5.1 架构概览
 
-| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** | **Agenda 目标** |
-|-----|-----------|-----------|----------|-----------------|----------------|
-| **调度粒度** | 独立 daemon 进程 | 独立 OS 线程 | 同进程 async task | **同进程 async + 可选 worktree** | 同进程 async（轻量） |
-| **触发方式** | `subagent_new` tool | `Agent` tool | `Agent` tool | **AgentTool + runForkedAgent()** | `agenda()` 函数（普通函数调用） |
-| **阻塞方式** | 同步/后台 | 仅后台（线程） | 前台/后台 | **前台/后台 + async generator 进度** | 前台（await） |
-| **生命周期** | manifest + watcher | 线程启动/结束 | async task | **query() 循环调用/返回** | 函数调用/返回 |
-| **缓存策略** | 无 | 无 | 无 | **forkedAgent 共享 cache + 独立 cache 双路径** | 无 |
+Codex 有两套 subagent 机制：**V1 多代理（multi_agents）** 和 **V2 多代理（multi_agents_v2）**，均通过 `codex_delegate.rs` 的 `run_codex_thread_interactive()` / `run_codex_thread_one_shot()` 实现底层复用。
 
-### 5.2 Context 传递对比
+```
+spawn agent tool
+  ├─ [V1] multi_agents/spawn.rs     ← 传统工具路径
+  └─ [V2] multi_agents_v2/spawn.rs  ← 新工具路径
+       ├─ agent_control.spawn_agent_with_metadata()
+       ├─ run_codex_thread_interactive() / run_codex_thread_one_shot()
+       │    ├─ Codex::spawn()  ← 创建独立的 Codex + Session
+       │    │    └─ SessionSource::SubAgent(subagent_source)
+       │    ├─ forward_events()  ← 事件转发（审批路由到 parent）
+       │    └─ forward_ops()     ← 操作转发
+       └─ 返回 thread_id + agent_path
+```
 
-| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** | **Agenda 目标** |
-|-----|-----------|-----------|----------|-----------------|----------------|
-| **消息历史** | ❌ 不传递 | ❌ 不传递 | ❌ 不传递 | **❌ 不传递（全新 mutableMessages[]）** | ❌ 不传递（显式 inputs） |
-| **System prompt** | 复制 system.md | 重建 | 从 spec 加载 | **AgentDefinition 整体替换 / CacheSafeParams 共享** | Agent Loop 统一（不区分 main/sub） |
-| **环境变量** | `BUTTERFLY_SESSION_ID` | 共享进程环境 | 共享 `builtin_args` | **通过 ToolUseContext 传递** | 通过 `inputs` 显式传递 |
-| **文件访问** | Symlink 读父目录 | 共享文件系统 | 共享文件系统 | **默认共享，可选 worktree 隔离** | `dep_inputs` 路由 + Workspace 隔离 |
-| **工具限制** | Guardian + mode | 白名单 | `tool_policy` allowlist | **AgentDefinition.tools + excludeTools 声明式** | 无限制（`agenda()` 就是普通 tool） |
+**核心文件**：
+- `codex-rs/core/src/codex_delegate.rs` — Subagent 创建与事件转发
+- `codex-rs/core/src/tools/handlers/multi_agents_v2/spawn.rs` — V2 spawn 工具
+- `codex-rs/core/src/tools/handlers/multi_agents_v2/send_message.rs` — 消息传递
+- `codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs` — 等待完成
+- `codex-rs/core/src/tools/handlers/multi_agents_v2/close_agent.rs` — 关闭
+- `codex-rs/core/src/tools/handlers/multi_agents_v2/list_agents.rs` — 列出
+- `codex-rs/core/src/tools/handlers/multi_agents_common.rs` — 共享逻辑
+- `codex-rs/core/src/agent/agent_resolver.rs` — Agent 角色解析
+- `codex-rs/core/src/agent/control.rs` — Agent 控制（SpawnAgentOptions）
 
-### 5.3 结果回传对比
+### 5.2 调度入口
 
-| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** | **Agenda 目标** |
-|-----|-----------|-----------|----------|-----------------|----------------|
-| **回传方式** | 轮询 context.jsonl | 写入文件 | 提取最后消息 | **完整消息 + 产物结构化 + onProgress 生成器** | `output/` 目录 + `dep_inputs` |
-| **结构化** | 纯文本（8000字截断） | 纯文本（markdown） | 纯文本 | **ContentBlock[] + 工具调用计数 + 耗时** | 文件产物（任意格式） |
-| **自动注入** | ✅ 后台模式自动注入 | ❌ 需主动读取 | ✅ Foreground 自动返回 | ✅ **Generator yield + async agent query** | ✅ `dep_inputs` 自动路由 |
+V2 spawn Agent 工具通过 `spawn_agent_with_metadata()` 启动 subagent：
 
-### 5.4 隔离与限制对比
+```rust
+// spawn.rs
+async fn handle(invocation: ToolInvocation) -> Result<SpawnAgentResult, FunctionCallError> {
+    let args: SpawnAgentArgs = parse_arguments(&arguments)?;  // message, task_name, agent_type, ...
+    let fork_mode = args.fork_mode()?;  // None / FullHistory / LastNTurns
+    
+    // 深度限制检查
+    let child_depth = next_thread_spawn_depth(&session_source);
+    if exceeds_thread_spawn_depth_limit(child_depth, max_depth) {
+        return Err("Agent depth limit reached. Solve the task yourself.");
+    }
+    
+    // 角色应用
+    apply_role_to_config(&mut config, role_name)?;
+    
+    // 发送 spawn 开始事件
+    CollabAgentSpawnBeginEvent { call_id, prompt, model, ... }
+    
+    // 执行 spawn
+    let result = session.services.agent_control
+        .spawn_agent_with_metadata(config, operation, spawn_source, SpawnAgentOptions {
+            fork_parent_spawn_call_id, fork_mode, environments,
+        }).await;
+    
+    // 发送 spawn 完成事件
+    CollabAgentSpawnEndEvent { call_id, new_thread_id, new_agent_nickname, ... }
+}
+```
 
-| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** | **Agenda 目标** |
-|-----|-----------|-----------|----------|-----------------|----------------|
-| **Workspace 隔离** | ✅ 完整目录隔离 | ❌ 无隔离 | ❌ 共享目录 | **⚡ 默认共享，可选 worktree 隔离** | ✅ 独立 workspace |
-| **Session 隔离** | ✅ 独立 context.jsonl | ✅ 独立 Session | ✅ 独立 context.jsonl | **✅ 独立 mutableMessages + sidechain transcript** | ✅ 独立 session |
-| **进程隔离** | ✅ 独立 daemon | ✅ 独立线程 | ❌ 同进程 | **❌ 同进程（async generator 内）** | ❌ 同进程（轻量） |
-| **嵌套深度** | `MAX_DEPTH = 2` | 禁止（白名单） | 禁止（role 检查） | **⚠️ AgentTool 禁止递归，fork 路径无限制** | `MAX_DEPTH` 软限制 |
-| **Subagent 等级** | 二等公民 | 二等公民 | 二等公民 | **⚡ 双路径：AgentTool（二等）+ Fork（一等）** | **一等公民** |
+**SpawnAgentOptions**：
+```rust
+struct SpawnAgentOptions {
+    fork_parent_spawn_call_id: Option<String>,  // fork 模式时的 call_id
+    fork_mode: Option<SpawnAgentForkMode>,       // None / FullHistory / LastNTurns(N)
+    environments: Option<Vec<...>>,              // 环境变量传递
+}
+```
+
+### 5.3 任务传递
+
+任务通过 `Op::UserInput` 或 `Op::InterAgentCommunication` 传递：
+
+```rust
+// 如果双方都有 agent_path，就用 InterAgentCommunication
+Op::InterAgentCommunication {
+    communication: InterAgentCommunication::new(
+        sender_path,      // parent 的 agent_path
+        recipient,        // child 的 agent_path
+        Vec::new(),       // 附件
+        prompt,           // 任务描述文本
+        trigger_turn: true,
+    ),
+}
+// 否则用普通的 UserInput
+Op::UserInput { items, ... }
+```
+
+### 5.4 Context 传递
+
+Codex 支持三种 Fork 模式：
+
+| Fork 模式 | 行为 | 使用场景 |
+|-----------|------|---------|
+| `None` (默认) | 全新上下文，不继承历史 | 独立子任务 |
+| `FullHistory` | 继承 parent 的完整历史 | 需要全部上下文的子任务 |
+| `LastNTurns(N)` | 继承 parent 的最后 N 轮 | 只需近期上下文的子任务 |
+
+```rust
+enum SpawnAgentForkMode {
+    FullHistory,           // 完整历史
+    LastNTurns(usize),     // 最后 N 轮
+}
+```
+
+**初始上下文注入**：
+- `initial_history: Option<InitialHistory>` — 可选传递初始历史
+- `environment_manager` — 从 parent 继承
+- `skills_manager` / `plugins_manager` / `mcp_manager` — 从 parent 共享
+
+### 5.5 结果回传
+
+Codex 通过事件流回传结果：
+
+```
+forward_events(codex, tx_sub, parent_session, parent_ctx, ...):
+  loop {
+    event = codex.next_event()
+    match event:
+      ExecApprovalRequest → 路由到 parent 审批
+      ApplyPatchApprovalRequest → 路由到 parent 审批
+      RequestPermissions → 路由到 parent 审批
+      RequestUserInput → 路由到 parent 审批
+      TurnComplete / TurnAborted → 转发给调用者
+      other → 直接转发
+  }
+```
+
+**关键设计**：所有审批请求都路由到 parent session，subagent 本身不做权限决策。
+
+### 5.6 Workspace 隔离
+
+- **共享文件系统**：Subagent 和 parent 在同一文件系统
+- **TurnContext.cwd**：每个 agent 有自己的工作目录约束
+- **独立 Session/Thread**：每个 subagent 有独立的 `CodexThread` 和 `Session`
+- **状态持久化**：独立 thread 存储在 state DB 中，通过 `thread_spawn_edges` 追踪 spawn 关系
+
+### 5.7 Codex 的关键设计点
+
+1. **双版本并存**：V1 (multi_agents) 和 V2 (multi_agents_v2) 同时维护，V2 是改进方向
+
+2. **Fork 模式递进**：None → LastNTurns → FullHistory，允许 caller 精确控制继承范围
+
+3. **审批路由到 parent**：Subagent 不自己处理权限，全部路由到 parent session
+
+4. **AgentPath 层次化**：通过 `AgentPath` 追踪 spawn 树结构，支持 root → child → grandchild 的多级层次
+
+5. **InterAgentCommunication**：当双方都有 agent_path 时使用结构化消息，支持触发 turn 语义
 
 ---
 
-## 六、输入传递机制详解
+## 六、综合对比
+
+### 6.1 调度机制对比
+
+| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** | **Codex** | **Agenda 目标** |
+|-----|-----------|-----------|----------|-----------------|-----------|----------------|
+| **调度粒度** | 独立 daemon 进程 | 独立 OS 线程 | 同进程 async task | **同进程 async + 可选 worktree** | **同进程 async + 独立 CodexThread** | 同进程 async（轻量） |
+| **触发方式** | `subagent_new` tool | `Agent` tool | `Agent` tool | **AgentTool + runForkedAgent()** | **spawn_agent + codex_delegate** | `agenda()` 函数（普通函数调用） |
+
+### 6.2 Context 传递对比
+
+| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** | **Codex** | **Agenda 目标** |
+|-----|-----------|-----------|----------|-----------------|-----------|----------------|
+| **消息历史** | ❌ 不传递 | ❌ 不传递 | ❌ 不传递 | **❌ 不传递** | **可选（FullHistory / LastNTurns / None）** | ❌ 不传递（显式 inputs） |
+| **System prompt** | 复制 system.md | 重建 | 从 spec 加载 | **AgentDefinition 整体替换** | **agent_type 角色 + apply_role_to_config()** | Agent Loop 统一 |
+| **环境变量** | `BUTTERFLY_SESSION_ID` | 共享进程环境 | 共享 `builtin_args` | **通过 ToolUseContext 传递** | **TurnEnvironment::selection() 继承** | 通过 `inputs` 显式传递 |
+| **文件访问** | Symlink 读父目录 | 共享文件系统 | 共享文件系统 | **默认共享，可选 worktree 隔离** | **共享文件系统 + TurnContext.cwd** | `dep_inputs` 路由 + Workspace 隔离 |
+| **工具限制** | Guardian + mode | 白名单 | `tool_policy` allowlist | **AgentDefinition 声明式** | **agent_type 角色 + depth limit** | 无限制（`agenda()` 就是普通 tool） |
+
+### 6.3 结果回传对比
+
+| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** | **Codex** | **Agenda 目标** |
+|-----|-----------|-----------|----------|-----------------|-----------|----------------|
+| **回传方式** | 轮询 context.jsonl | 写入文件 | 提取最后消息 | **完整消息 + onProgress 生成器** | **事件流 forward_events() + InterAgentCommunication** | `output/` 目录 + `dep_inputs` |
+| **结构化** | 纯文本（8000字截断） | 纯文本（markdown） | 纯文本 | **ContentBlock[] + 工具调用计数 + 耗时** | **结构化事件 + AgentStatus** | 文件产物（任意格式） |
+| **自动注入** | ✅ 后台模式自动注入 | ❌ 需主动读取 | ✅ Foreground 自动返回 | ✅ **Generator yield** | ✅ **事件流自动转发** | ✅ `dep_inputs` 自动路由 |
+
+### 6.4 隔离与限制对比
+
+| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** | **Codex** | **Agenda 目标** |
+|-----|-----------|-----------|----------|-----------------|-----------|----------------|
+| **Workspace 隔离** | ✅ 完整目录隔离 | ❌ 无隔离 | ❌ 共享目录 | **⚡ 默认共享，可选 worktree 隔离** | **共享 + TurnContext.cwd 约束** | ✅ 独立 workspace |
+| **Session 隔离** | ✅ 独立 context.jsonl | ✅ 独立 Session | ✅ 独立 context.jsonl | **✅ 独立 sidechain transcript** | **✅ 独立 CodexThread + Session** | ✅ 独立 session |
+| **进程隔离** | ✅ 独立 daemon | ✅ 独立线程 | ❌ 同进程 | **❌ 同进程** | **❌ 同进程** | ❌ 同进程（轻量） |
+| **嵌套深度** | `MAX_DEPTH = 2` | 禁止（白名单） | 禁止（role 检查） | **⚠️ AgentTool 禁止递归，fork 路径无限制** | **exceeds_thread_spawn_depth_limit + agent_max_depth** | `MAX_DEPTH` 软限制 |
+| **Subagent 等级** | 二等公民 | 二等公民 | 二等公民 | **⚡ 双路径：AgentTool（二等）+ Fork（一等）** | **双版本：V1 + V2（改进中）** | **一等公民** |
+
+---
+
+## 七、输入传递机制详解
 
 本章节专门分析三个库在启动 subagent 时，**输入（文件/数据）、任务、context 的具体传递机制**。这是 Agenda `inputs` 参数设计的核心参考。
 
-### 6.1 Butterfly Agent 的输入传递
+### 7.1 Butterfly Agent 的输入传递
 
 **任务传递：**
 
@@ -958,7 +1109,7 @@ shutil.copy2(mode_src, core_dir / "mode.md")
 
 ---
 
-### 6.2 Claw Code 的输入传递
+### 7.2 Claw Code 的输入传递
 
 **任务传递：**
 
@@ -1003,7 +1154,7 @@ fn execute_agent_with_spawn<F>(input: AgentInput, spawn_fn: F) -> Result<AgentOu
 
 ---
 
-### 6.3 Kimi CLI 的输入传递
+### 7.3 Kimi CLI 的输入传递
 
 **任务传递：**
 
@@ -1060,7 +1211,7 @@ async def prepare_soul(spec: SubagentRunSpec, runtime: Runtime, ...):
 
 ---
 
-### 6.4 Claude Code 的输入传递
+### 7.4 Claude Code 的输入传递
 
 **任务传递：**
 
@@ -1120,70 +1271,70 @@ Fork 路径可传递部分上下文消息（不含历史对话，仅包含当前
 | 工作目录 | 共享 / worktree 隔离 | 共享 |
 | 状态 | ToolUseContext 隔离 | forkedAgentContext |
 
-### 6.5 共同模式总结
+### 7.5 共同模式总结
 
-| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** | 模式 |
-|-----|-----------|-----------|----------|-----------------|------|
-| **消息历史** | ❌ 不传递 | ❌ 不传递 | ❌ 不传递 | **❌ 不传递 / forkContextMessages 有限传递** | **共识：子 agent 不继承 parent 对话历史** |
-| **任务传递** | `initial_message` → context.jsonl | `prompt` → AgentJob | `prompt` → spec | **`prompt` → AgentTool input / `directive` → fork** | 都通过参数直接传递 |
-| **文件传递** | 复制 + symlink | 无（共享目录） | 无（共享目录） | **共享 / worktree / remote 三种模式** | Butterfly 最复杂，其他共享 |
-| **System prompt** | 复制 system.md | 重建 | 从 spec 加载 | **AgentDefinition 替换 / 共享主线程（fork）** | 都不直接继承 parent |
-| **环境变量** | `BUTTERFLY_SESSION_ID` | 共享进程环境 | 共享 `builtin_args` | **ToolUseContext 透传** | 各不相同 |
-| **缓存共享** | 无 | 无 | 无 | **fork 路径字节级匹配主线程 cache** | Claude Code 独有 |
-| **Context 规模** | 大量文件复制 | 最小（仅 prompt） | 中等（共享 runtime 引用） | **中等（ToolUseContext 克隆 + CacheSafeParams）** | Butterfly 最重，Claw 最轻 |
+| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** | **Codex** | 模式 |
+|-----|-----------|-----------|----------|-----------------|-----------|------|
+| **消息历史** | ❌ 不传递 | ❌ 不传递 | ❌ 不传递 | **❌ 不传递 / forkContextMessages 有限传递** | **可选 FullHistory / LastNTurns / None** | **共识：子 agent 不继承 parent 对话历史为主流** |
+| **任务传递** | `initial_message` → context.jsonl | `prompt` → AgentJob | `prompt` → spec | **`prompt` → AgentTool input** | **Op::UserInput / InterAgentCommunication** | 都通过参数直接传递 |
+| **文件传递** | 复制 + symlink | 无（共享目录） | 无（共享目录） | **共享 / worktree / remote 三种模式** | **共享文件系统** | Butterfly 最复杂，其他共享 |
+| **System prompt** | 复制 system.md | 重建 | 从 spec 加载 | **AgentDefinition 替换 / 共享主线程（fork）** | **agent_type 角色 + apply_role_to_config()** | 都不直接继承 parent |
+| **环境变量** | `BUTTERFLY_SESSION_ID` | 共享进程环境 | 共享 `builtin_args` | **ToolUseContext 透传** | **TurnEnvironment 选择继承** | 各不相同 |
+| **缓存共享** | 无 | 无 | 无 | **fork 路径字节级匹配主线程 cache** | 无 | Claude Code 独有 |
+| **Context 规模** | 大量文件复制 | 最小（仅 prompt） | 中等（共享 runtime 引用） | **中等（ToolUseContext 克隆 + CacheSafeParams）** | **中等（Session 共享 + Fork 模式控制）** | Butterfly 最重，Claw 最轻 |
 
 ---
 
-## 七、对 Agenda DAG 层设计的启示
+## 八、对 Agenda DAG 层设计的启示
 
-### 7.1 必须避免的设计
+### 8.1 必须避免的设计
 
 1. **不要特殊的 subagent API**
-   - Butterfly 的 `subagent_new`、Claw 的 `Agent` tool、Kimi 的 `Agent` tool、Claude Code 的 AgentTool 都是特殊入口
+   - Butterfly 的 `subagent_new`、Claw 的 `Agent` tool、Kimi 的 `Agent` tool、Claude Code 的 AgentTool、Codex 的 multi_agents_v2/spawn 都是特殊入口
    - Agenda：`agenda()` 就是普通函数，Agent Loop 调用它和调用 `read_file` 没有区别
 
 2. **不要 role/身份区分**
-   - Kimi 的 `role != "root"` 检查明确禁止嵌套
-   - Claude Code 的 ALL_AGENT_DISALLOWED_TOOLS 也排除 AgentTool
+   - Kimi 的 `role != "root"` 检查、Codex 的 SessionSource::SubAgent 都明确区分身份
    - Agenda：没有 main/sub 之分，所有 Agent 共享同一个 AgentLoop
 
 3. **不要工具白名单限制递归**
    - Claw 的 `allowed_tools_for_subagent()`、Claude Code 的 `ALL_AGENT_DISALLOWED_TOOLS` 都排除 Agent 工具
+   - Codex 用 exceeds_thread_spawn_depth_limit 做深度限制，但不排除工具
    - Agenda：`agenda()` 在工具集中可用，Agent 可自由调用
 
 4. **不要复杂的文件 seeding**
    - Butterfly 复制大量文件（system/task/env/skills/memory/tools/config/mode）
    - Agenda：通过 `inputs` 参数显式传递，不自动复制
 
-### 7.2 应该借鉴的设计
+### 8.2 应该借鉴的设计
 
 1. **Workspace 隔离（学 Butterfly + Claude Code worktree）**
    - 每个 `agenda()` 调用创建独立 workspace
-   - Claude Code 的可选 `isolation: 'worktree'` 提供了灵活度
    - Agenda：默认 workspace 隔离 + 可选共享模式
 
-2. **Context 不自动继承（学四家）**
+2. **Context 不自动继承（学五家 + Codex 可选继承模式）**
    - 子 agent 不自动继承 parent 的消息历史
-   - 通过 `inputs` 参数显式传递上下文
-   - 避免 context 污染
+   - Codex 的 Fork 模式（None / FullHistory / LastNTurns）提供了灵活的可选继承
+   - Agenda：通过 `inputs` 参数显式传递上下文
 
-3. **结构化产物回传（改进四家 + 学 Claude Code）**
-   - Butterfly/Claw/Kimi 都是"提取最终文本"
-   - Claude Code 的 ContentBlock[] + 工具调用计数 + 耗时结构化更丰富
+3. **结构化产物回传（改进五家）**
+   - Codex 的 InterAgentCommunication + 事件流 forward_events() 模式值得参考
    - Agenda：通过 `output/` 目录产出文件，`dep_inputs` 结构化路由
 
-4. **同进程轻量调度（学 Kimi + Claude Code）**
-   - Butterfly 的独立 daemon 太重
-   - Claw 的独立线程也不错但 Rust 特有
-   - Kimi 的 `asyncio.create_task()` + Claude Code 的 async generator 最轻量
+4. **同进程轻量调度（学 Kimi + Claude Code + Codex）**
+   - Codex 的 codex_delegate 也是同进程 async spawn
    - Agenda：同进程 async，支持进度回调
 
-5. **Context 对象隔离（学 Claude Code ToolUseContext）**
-   - Claude Code 通过 `createSubagentContext()` 创建隔离上下文
-   - 非全局变量，显式参数传递
-   - Agenda：Session 作为上下文容器
+5. **审批路由（学 Codex + Claude Code）**
+   - Codex 的 subagent 审批全部路由到 parent session，subagent 不做独立权限决策
+   - Claude Code 的 `bubble` 权限模式类似
+   - Agenda：子 agent 的权限决策可由 parent 控制
 
-### 7.3 Agenda 的 `inputs` 设计草案
+6. **深度限制（学 Codex）**
+   - Codex 的 exceeds_thread_spawn_depth_limit + agent_max_depth 是最干净的实现
+   - Agenda：MAX_DEPTH 软限制，可配置
+
+### 8.3 Agenda 的 `inputs` 设计草案
 
 基于以上调研，Agenda 的输入传递应该：
 
@@ -1211,7 +1362,7 @@ class Inputs:
 | ✅ Context 对象显式传递 | 学 Claude Code | Session 参数，非全局变量 |
 | ✅ 异步进度回调 | 学 Claude Code | 可选的 on_progress 生成器 |
 
-### 7.4 Agenda DAG 层的实现要求
+### 8.4 Agenda DAG 层的实现要求
 
 基于以上调研，DAG 层需要满足：
 

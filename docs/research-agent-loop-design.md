@@ -1,6 +1,6 @@
 # Agent Loop 与 Subagent Loop 设计调研报告
 
-> 调研对象：Butterfly Agent、Claw Code、Kimi CLI、Claude Code
+> 调研对象：Butterfly Agent、Claw Code、Kimi CLI、Claude Code、Codex
 > 调研目的：为 Agenda 的 Agent Loop 层设计提供参考，明确"Subagent 一等公民"的实现路径
 
 ---
@@ -574,15 +574,15 @@ const ASYNC_AGENT_ALLOWED_TOOLS = [
 
 ## 四、唤醒/Reload 对比
 
-| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** |
-|-----|-----------|-----------|----------|-----------------|
-| **持久化文件** | context.jsonl | .claw/sessions/<hash>/<id>.jsonl | context.jsonl | **transcript.jsonl + sidechain/<agentId>.jsonl** |
-| **恢复粒度** | turn 级别 | 完整 session | checkpoint 级别 | **消息级别（parentUuid 链式回放）** |
-| **隔离** | session ID | workspace fingerprint | subagent ID | **agentId + sessionId + project 多维** |
-| **后台任务恢复** | sweep_restart | 无 | background task snapshot | **registerAsyncAgent 重新发现** |
-| **回滚** | 无 | 无 | revert_to() | **--resume 命令行 / 无显式 checkpoint** |
-| **Session 元数据** | manifest.json | metadata.json | meta.json | **metadata.json + reAppendSessionMetadata()** |
-| **Fork 恢复** | 无 | 无 | 无 | **CacheSafeParams 缓存复用 + forkContextMessages** |
+| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** | **Codex** |
+|-----|-----------|-----------|----------|-----------------|-----------|
+| **持久化文件** | context.jsonl | .claw/sessions/<hash>/<id>.jsonl | context.jsonl | **transcript.jsonl + sidechain/<agentId>.jsonl** | **state DB + rollout + thread_spawn_edges** |
+| **恢复粒度** | turn 级别 | 完整 session | checkpoint 级别 | **消息级别（parentUuid 链式回放）** | **session 级别（state DB 恢复）** |
+| **隔离** | session ID | workspace fingerprint | subagent ID | **agentId + sessionId + project 多维** | **ThreadId + SessionSource::SubAgent** |
+| **后台任务恢复** | sweep_restart | 无 | background task snapshot | **registerAsyncAgent 重新发现** | **agent_control.spawn_agent_with_metadata()** |
+| **回滚** | 无 | 无 | revert_to() | **--resume 命令行** | **drop_last_n_user_turns + history_version** |
+| **Session 元数据** | manifest.json | metadata.json | meta.json | **metadata.json + reAppendSessionMetadata()** | **ThreadConfigSnapshot + AgentStatus** |
+| **Fork 恢复** | 无 | 无 | 无 | **CacheSafeParams 缓存复用** | **SpawnAgentForkMode (None/FullHistory/LastNTurns)** |
 
 ---
 
