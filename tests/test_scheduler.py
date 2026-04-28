@@ -164,6 +164,7 @@ class TestInferDepth:
 # Scheduler run loop
 # ---------------------------------------------------------------------------
 
+
 class TestSchedulerRunLoop:
     def test_empty_dag_returns_empty(self, tmp_path: Path) -> None:
         scheduler = DAGScheduler(tmp_path, "test")

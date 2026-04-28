@@ -36,6 +36,7 @@ def workspace(tmp_path: Path) -> Path:
 # Base Case: single-node DAG
 # ---------------------------------------------------------------------------
 
+
 class TestLiveBaseCase:
     async def _run(self, dag_spec: dict, workspace: Path) -> dict[str, str]:
         return await agenda(dag_spec, workspace)
@@ -47,8 +48,7 @@ class TestLiveBaseCase:
             "nodes": {
                 "hello": {
                     "prompt": (
-                        "你是一个测试助手。"
-                        "请用 write_file 工具写一句关于人工智能的简短问候语到 output/draft.md。"
+                        "你是一个测试助手。请用 write_file 工具写一句关于人工智能的简短问候语到 output/draft.md。"
                     ),
                     "model": "deepseek-flash",
                     "max_iterations": 5,
@@ -97,6 +97,7 @@ class TestLiveBaseCase:
 # Multi-node DAG: dependency chain
 # ---------------------------------------------------------------------------
 
+
 class TestLiveMultiNode:
     async def _run(self, dag_spec: dict, workspace: Path) -> dict[str, str]:
         return await agenda(dag_spec, workspace)
@@ -107,23 +108,16 @@ class TestLiveMultiNode:
             "dag": {"name": "chain", "max_parallel": 2},
             "nodes": {
                 "writer": {
-                    "prompt": (
-                        "写一段关于'未来城市'的 30 字短文，保存到 output/draft.md。"
-                    ),
+                    "prompt": ("写一段关于'未来城市'的 30 字短文，保存到 output/draft.md。"),
                     "model": "deepseek-flash",
                     "max_iterations": 5,
                     "timeout": 60,
                 },
                 "reader": {
-                    "prompt": (
-                        "读取 input/deps/writer.md 中的内容，"
-                        "写一段 20 字的评论，保存到 output/draft.md。"
-                    ),
+                    "prompt": ("读取 input/deps/writer.md 中的内容，写一段 20 字的评论，保存到 output/draft.md。"),
                     "model": "deepseek-flash",
                     "deps": ["writer"],
-                    "dep_inputs": [
-                        {"from": "nodes/writer/output/draft.md", "to": "deps/writer.md"}
-                    ],
+                    "dep_inputs": [{"from": "nodes/writer/output/draft.md", "to": "deps/writer.md"}],
                     "max_iterations": 5,
                     "timeout": 60,
                 },
@@ -176,6 +170,7 @@ class TestLiveMultiNode:
 # ---------------------------------------------------------------------------
 # Model fallback via live API
 # ---------------------------------------------------------------------------
+
 
 class TestLiveFallback:
     def test_fallback_on_invalid_model(self, workspace: Path) -> None:

@@ -56,6 +56,7 @@ async def run_agent_node(
     ) -> str:
         """启动子 DAG 实现递归分解。dag_yaml 为 DAG 的 YAML 定义。"""
         import yaml as _yaml
+
         dag_spec = _yaml.safe_load(dag_yaml)
         ws = Path(workspace) if workspace else session.workspace_dir / "subdags"
         ws.mkdir(parents=True, exist_ok=True)
@@ -148,7 +149,7 @@ async def run_sub_dag(
 
         hints = f"""# 任务: {node_id}
 ## 提示
-{node_cfg.get('prompt', '')}{files_section}
+{node_cfg.get("prompt", "")}{files_section}
 ## 规则
 - 用 read_file / write_file 工具操作文件
 - 按需读取 input/ 下的内容，不要一次性加载所有

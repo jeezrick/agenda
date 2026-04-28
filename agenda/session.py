@@ -66,10 +66,7 @@ class Session:
         if not safe:
             return self._format_path_error(rel_path)
         if not target.exists():
-            return (
-                f"[错误] 文件不存在: {rel_path}\n"
-                f"提示: 可用 list_dir('.') 查看可用目录和文件。"
-            )
+            return f"[错误] 文件不存在: {rel_path}\n提示: 可用 list_dir('.') 查看可用目录和文件。"
         return target.read_text(encoding="utf-8")
 
     def write_file(self, rel_path: str, content: str) -> str:
@@ -107,10 +104,7 @@ class Session:
         if not safe:
             return self._format_path_error(rel_path)
         if not target.exists():
-            return (
-                f"[错误] 目录不存在: {rel_path}\n"
-                f"提示: 可用 list_dir('.') 查看可用目录。"
-            )
+            return f"[错误] 目录不存在: {rel_path}\n提示: 可用 list_dir('.') 查看可用目录。"
         lines = []
         for item in sorted(target.iterdir()):
             t = "[目录]" if item.is_dir() else "[文件]"

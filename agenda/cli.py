@@ -466,12 +466,14 @@ def _run_dag(dag_path: Path, models_path: Path | None, max_parallel: int) -> int
 
     from . import agenda as _agenda
 
-    results = asyncio.run(_agenda(
-        dag_spec=scheduler.dag,
-        workspace=scheduler.dag_dir,
-        model_registry=scheduler.model_registry,
-        tools_factory=lambda session: build_tools(session),
-    ))
+    results = asyncio.run(
+        _agenda(
+            dag_spec=scheduler.dag,
+            workspace=scheduler.dag_dir,
+            model_registry=scheduler.model_registry,
+            tools_factory=lambda session: build_tools(session),
+        )
+    )
     _json_out({"results": results})
     failed = [n for n, s in results.items() if s == "FAILED"]
     pending = [n for n, s in results.items() if s == "PENDING"]
@@ -613,10 +615,12 @@ def _init_workspace(target_dir: Path) -> None:
     models_path = target_dir / "models.yaml"
     if not models_path.exists():
         models_path.write_text(DEFAULT_MODELS_YAML, encoding="utf-8")
-    _json_out({
-        "init": str(target_dir.resolve()),
-        "files": ["dag.yaml", "models.yaml"],
-    })
+    _json_out(
+        {
+            "init": str(target_dir.resolve()),
+            "files": ["dag.yaml", "models.yaml"],
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -719,7 +723,9 @@ def cli() -> int:
     run_parser.add_argument("--ephemeral", "-e", action="store_true", help="用完即走：跑完后自动删除工作区")
     run_parser.add_argument("--max-iterations", type=int, default=50, help="最大迭代轮数，默认 50")
     run_parser.add_argument("--timeout", type=int, default=600, help="超时秒数，默认 600")
-    run_parser.add_argument("--input-file", "-i", action="append", default=[], help="输入文件路径（可多次指定，复制到节点 input/）")
+    run_parser.add_argument(
+        "--input-file", "-i", action="append", default=[], help="输入文件路径（可多次指定，复制到节点 input/）"
+    )
 
     # ------------------------------------------------------------------
     # guide
@@ -744,6 +750,7 @@ def cli() -> int:
         workspace = Path(args.output_dir).expanduser().resolve()
         if args.ephemeral:
             import tempfile
+
             workspace = Path(tempfile.mkdtemp(prefix="agenda-quick-"))
 
         node_id = "task"
@@ -783,6 +790,7 @@ def cli() -> int:
         dag_file = workspace / "dag.yaml"
         try:
             import yaml
+
             dag_file.write_text(yaml.safe_dump(single_dag, allow_unicode=True, sort_keys=False), "utf-8")
         except Exception:
             pass  # yaml 写失败不影响运行
@@ -797,12 +805,14 @@ def cli() -> int:
         from . import agenda as _agenda
 
         try:
-            results = asyncio.run(_agenda(
-                dag_spec=single_dag,
-                workspace=workspace,
-                model_registry=registry,
-                tools_factory=lambda session: build_tools(session),
-            ))
+            results = asyncio.run(
+                _agenda(
+                    dag_spec=single_dag,
+                    workspace=workspace,
+                    model_registry=registry,
+                    tools_factory=lambda session: build_tools(session),
+                )
+            )
         except KeyboardInterrupt:
             _json_out({"interrupted": True})
             if args.ephemeral and workspace.exists():
@@ -852,12 +862,7 @@ def cli() -> int:
                     sections[current] = []
                 elif current is not None:
                     sections[current].append(line)
-            _json_out({
-                "guide": {
-                    title: "\n".join(lines).strip()
-                    for title, lines in sections.items()
-                }
-            })
+            _json_out({"guide": {title: "\n".join(lines).strip() for title, lines in sections.items()}})
         else:
             if args.for_agent:
                 print(AGENT_GUIDE)
@@ -882,6 +887,7 @@ def cli() -> int:
 
         if args.dag_cmd == "create":
             import yaml
+
             src = args.from_json
             data = json.loads(sys.stdin.read() if src == "-" else Path(src).read_text("utf-8"))
             if "nodes" not in data:
@@ -902,10 +908,9 @@ def cli() -> int:
                     "valid": len(errors) == 0,
                     "path": str(scheduler.dag_file),
                     "nodes": len(scheduler.dag.get("nodes", {})),
-                    "models": sorted({
-                        c.get("model") for c in scheduler.dag.get("nodes", {}).values()
-                        if c.get("model")
-                    }),
+                    "models": sorted(
+                        {c.get("model") for c in scheduler.dag.get("nodes", {}).values() if c.get("model")}
+                    ),
                     "warnings": warnings,
                     "errors": errors,
                 }
@@ -924,16 +929,18 @@ def cli() -> int:
             if args.dry_run:
                 try:
                     scheduler = _load_scheduler(dag_path, models_path)
-                    _json_out({
-                        "dry_run": True,
-                        "dag": str(dag_path),
-                        "max_parallel": max_parallel,
-                        "topo": scheduler.topological_sort(),
-                        "nodes": {
-                            n: {"model": c.get("model", "default"), "deps": c.get("deps", [])}
-                            for n, c in scheduler.dag.get("nodes", {}).items()
-                        },
-                    })
+                    _json_out(
+                        {
+                            "dry_run": True,
+                            "dag": str(dag_path),
+                            "max_parallel": max_parallel,
+                            "topo": scheduler.topological_sort(),
+                            "nodes": {
+                                n: {"model": c.get("model", "default"), "deps": c.get("deps", [])}
+                                for n, c in scheduler.dag.get("nodes", {}).items()
+                            },
+                        }
+                    )
                     return EXIT_SUCCESS
                 except FileNotFoundError as e:
                     return _error_out(str(e), EXIT_ARGS_ERROR)
@@ -984,12 +991,14 @@ def cli() -> int:
 
         if args.node_cmd == "run":
             try:
-                return asyncio.run(_run_single_node(
-                    _resolve_dag_path(args.path),
-                    args.node,
-                    _resolve_models_path(args.models),
-                    force=args.force,
-                ))
+                return asyncio.run(
+                    _run_single_node(
+                        _resolve_dag_path(args.path),
+                        args.node,
+                        _resolve_models_path(args.models),
+                        force=args.force,
+                    )
+                )
             except KeyboardInterrupt:
                 _json_out({"interrupted": True})
                 return 130
@@ -1032,12 +1041,14 @@ def cli() -> int:
                 session = Session(scheduler.nodes_dir / args.node)
                 error_log = session.read_system("error.log")
                 state = session.get_state("status")
-                _json_out({
-                    "node": args.node,
-                    "status": state,
-                    "error_log": error_log or None,
-                    "output_exists": session.output_exists,
-                })
+                _json_out(
+                    {
+                        "node": args.node,
+                        "status": state,
+                        "error_log": error_log or None,
+                        "output_exists": session.output_exists,
+                    }
+                )
                 return EXIT_SUCCESS
             except FileNotFoundError as e:
                 return _error_out(str(e), EXIT_ARGS_ERROR)
@@ -1054,7 +1065,11 @@ def cli() -> int:
 
         from .daemon import _cmd_status, _cmd_stop, _start_daemon, _start_foreground
 
-        dag_path = _resolve_dag_path(args.path) if hasattr(args, "path") and args.path else Path(os.environ.get("AGENDA_DAG", "."))
+        dag_path = (
+            _resolve_dag_path(args.path)
+            if hasattr(args, "path") and args.path
+            else Path(os.environ.get("AGENDA_DAG", "."))
+        )
         dag_dir = dag_path.parent if dag_path.is_file() else dag_path
 
         if args.daemon_cmd == "start":
@@ -1086,14 +1101,16 @@ def cli() -> int:
         if args.models_cmd == "list":
             models_result: list[dict] = []
             for name, cfg in registry._models.items():
-                models_result.append({
-                    "name": name,
-                    "model": cfg.model,
-                    "base_url": cfg.base_url,
-                    "token_cap": cfg.token_cap,
-                    "temperature": cfg.temperature,
-                    "max_tokens": cfg.max_tokens,
-                })
+                models_result.append(
+                    {
+                        "name": name,
+                        "model": cfg.model,
+                        "base_url": cfg.base_url,
+                        "token_cap": cfg.token_cap,
+                        "temperature": cfg.temperature,
+                        "max_tokens": cfg.max_tokens,
+                    }
+                )
             _json_out({"models": models_result})
             return EXIT_SUCCESS
 

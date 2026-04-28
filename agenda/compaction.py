@@ -76,10 +76,7 @@ def should_auto_compact(
     - Ratio-based: token_count >= max_context_size * trigger_ratio
     - Reserved-based: token_count + reserved_context_size >= max_context_size
     """
-    return (
-        token_count >= max_context_size * trigger_ratio
-        or token_count + reserved_context_size >= max_context_size
-    )
+    return token_count >= max_context_size * trigger_ratio or token_count + reserved_context_size >= max_context_size
 
 
 class SimpleCompaction:
@@ -137,7 +134,7 @@ class SimpleCompaction:
 
             # 向前移动 idx，把缺失部分纳入保留区。
             # 无论缺失的是结果还是 assistant，都需要找到对应 assistant 的位置
-            #（因为 assistant 一定在 tool 结果之前）。
+            # （因为 assistant 一定在 tool 结果之前）。
             new_idx = idx
             for i in range(idx - 1, -1, -1):
                 msg = history[i]
@@ -153,9 +150,7 @@ class SimpleCompaction:
 
         return idx
 
-    def prepare(
-        self, messages: list[dict], *, custom_instruction: str = ""
-    ) -> tuple[dict | None, list[dict]]:
+    def prepare(self, messages: list[dict], *, custom_instruction: str = "") -> tuple[dict | None, list[dict]]:
         """准备压缩。
 
         Returns:
@@ -181,9 +176,7 @@ class SimpleCompaction:
             return None, list(messages)
 
         # 边界安全：不拆散 tool_use/tool_result 对
-        preserve_start_index = self._ensure_tool_pair_integrity(
-            history, preserve_start_index
-        )
+        preserve_start_index = self._ensure_tool_pair_integrity(history, preserve_start_index)
 
         to_compact = history[:preserve_start_index]
         to_preserve = history[preserve_start_index:]
@@ -270,8 +263,7 @@ class SimpleCompaction:
             {
                 "role": "user",
                 "content": (
-                    "Previous context has been compacted. "
-                    "Here is the compaction output:\n\n" + compacted_content
+                    "Previous context has been compacted. Here is the compaction output:\n\n" + compacted_content
                 ),
             },
         ]

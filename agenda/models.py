@@ -15,19 +15,19 @@ except ImportError:
     sys.exit(1)
 
 
-
 @dataclass
 class ModelConfig:
     """单个模型的配置。"""
-    name: str                # 模型别名，如 "deepseek"、"kimi"
-    base_url: str            # API 端点
-    api_key: str             # API 密钥
-    model: str               # 实际模型名，如 "deepseek-chat"
-    token_cap: int = 32000   # 上下文窗口上限
-    provider: str = "openai" # 预留：未来支持非 OpenAI 接口
-    fallback_model: str | None = None   # 备用模型名（主模型失败时切换）
-    fallback_provider: str | None = None # 备用 provider
-    temperature: float = 1.0 # 采样温度（DeepSeek 建议 Agent 用 1.0）
+
+    name: str  # 模型别名，如 "deepseek"、"kimi"
+    base_url: str  # API 端点
+    api_key: str  # API 密钥
+    model: str  # 实际模型名，如 "deepseek-chat"
+    token_cap: int = 32000  # 上下文窗口上限
+    provider: str = "openai"  # 预留：未来支持非 OpenAI 接口
+    fallback_model: str | None = None  # 备用模型名（主模型失败时切换）
+    fallback_provider: str | None = None  # 备用 provider
+    temperature: float = 1.0  # 采样温度（DeepSeek 建议 Agent 用 1.0）
     max_tokens: int | None = None  # 最大输出 token 数
     extra_params: dict | None = None  # provider-specific 参数（如 thinking、reasoning_effort）
 
@@ -74,8 +74,15 @@ class ModelRegistry:
                 continue
             # 标准字段
             standard_fields = {
-                "base_url", "api_key", "model", "token_cap", "provider",
-                "fallback_model", "fallback_provider", "temperature", "max_tokens",
+                "base_url",
+                "api_key",
+                "model",
+                "token_cap",
+                "provider",
+                "fallback_model",
+                "fallback_provider",
+                "temperature",
+                "max_tokens",
             }
             extra = {k: v for k, v in cfg.items() if k not in standard_fields}
             self._models[name] = ModelConfig(
@@ -96,7 +103,7 @@ class ModelRegistry:
         """解析 ${ENV_VAR} 格式的值。"""
         if not isinstance(value, str):
             return str(value)
-        match = re.match(r'^\$\{([^}]+)\}$', value.strip())
+        match = re.match(r"^\$\{([^}]+)\}$", value.strip())
         if match:
             env_name = match.group(1)
             env_val = os.environ.get(env_name, "")
@@ -130,4 +137,3 @@ class ModelRegistry:
 
     def list_models(self) -> list[str]:
         return list(self._models.keys())
-

@@ -17,6 +17,7 @@ from agenda.tools import ToolRegistry
 # Fixtures
 # ---------------------------------------------------------------------------
 
+
 @pytest.fixture
 def mock_registry() -> ModelRegistry:
     reg = ModelRegistry()
@@ -53,19 +54,24 @@ def simple_tools() -> ToolRegistry:
 # AgentLoop.run — happy path
 # ---------------------------------------------------------------------------
 
+
 class TestAgentLoopRun:
-    def test_run_from_scratch_no_tools(self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry) -> None:
+    def test_run_from_scratch_no_tools(
+        self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry
+    ) -> None:
         """LLM returns completion directly, no tool_calls."""
         session = Session(tmp_path / "node")
         agent = AgentLoop(session, mock_registry, simple_tools, max_iterations=5, timeout=60)
 
         mock_resp = {
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "final answer",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "final answer",
+                    }
                 }
-            }]
+            ]
         }
 
         with patch.object(agent, "_call_llm", new=AsyncMock(return_value=mock_resp)):
@@ -77,30 +83,38 @@ class TestAgentLoopRun:
         assert len(turns) == 1
         assert turns[0]["iteration"] == 1
 
-    def test_run_with_tool_call_then_completion(self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry) -> None:
+    def test_run_with_tool_call_then_completion(
+        self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry
+    ) -> None:
         """LLM returns tool_call, then completion."""
         session = Session(tmp_path / "node")
         agent = AgentLoop(session, mock_registry, simple_tools, max_iterations=5, timeout=60)
 
         tool_resp = {
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [{
-                        "id": "tc1",
-                        "function": {"name": "echo", "arguments": '{"msg": "hello"}'},
-                    }],
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "tc1",
+                                "function": {"name": "echo", "arguments": '{"msg": "hello"}'},
+                            }
+                        ],
+                    }
                 }
-            }]
+            ]
         }
         final_resp = {
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "done",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "done",
+                    }
                 }
-            }]
+            ]
         }
 
         with patch.object(agent, "_call_llm", new=AsyncMock(side_effect=[tool_resp, final_resp])):
@@ -114,30 +128,38 @@ class TestAgentLoopRun:
         assert len(tool_msgs) == 1
         assert "echo:hello" in tool_msgs[0]["content"]
 
-    def test_run_with_async_tool(self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry) -> None:
+    def test_run_with_async_tool(
+        self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry
+    ) -> None:
         """Async tool should be awaited correctly."""
         session = Session(tmp_path / "node")
         agent = AgentLoop(session, mock_registry, simple_tools, max_iterations=5, timeout=60)
 
         tool_resp = {
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [{
-                        "id": "tc1",
-                        "function": {"name": "async_echo", "arguments": '{"msg": "world"}'},
-                    }],
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "tc1",
+                                "function": {"name": "async_echo", "arguments": '{"msg": "world"}'},
+                            }
+                        ],
+                    }
                 }
-            }]
+            ]
         }
         final_resp = {
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "ok",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "ok",
+                    }
                 }
-            }]
+            ]
         }
 
         with patch.object(agent, "_call_llm", new=AsyncMock(side_effect=[tool_resp, final_resp])):
@@ -147,25 +169,31 @@ class TestAgentLoopRun:
         tool_msgs = [m for m in agent.messages if m.get("role") == "tool"]
         assert "async:world" in tool_msgs[0]["content"]
 
-    def test_run_restores_history(self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry) -> None:
+    def test_run_restores_history(
+        self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry
+    ) -> None:
         """If turns.jsonl exists, run should restore history."""
         session = Session(tmp_path / "node")
-        session.save_turn({
-            "type": "turn",
-            "messages": [
-                {"role": "user", "content": "previous task"},
-                {"role": "assistant", "content": "previous result"},
-            ],
-        })
+        session.save_turn(
+            {
+                "type": "turn",
+                "messages": [
+                    {"role": "user", "content": "previous task"},
+                    {"role": "assistant", "content": "previous result"},
+                ],
+            }
+        )
 
         agent = AgentLoop(session, mock_registry, simple_tools, max_iterations=5, timeout=60)
         mock_resp = {
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "continued",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "continued",
+                    }
                 }
-            }]
+            ]
         }
 
         with patch.object(agent, "_call_llm", new=AsyncMock(return_value=mock_resp)):
@@ -178,25 +206,34 @@ class TestAgentLoopRun:
         # previous messages restored (except system)
         assert any(m.get("content") == "previous result" for m in agent.messages)
 
-    def test_run_max_iterations_exceeded(self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry) -> None:
+    def test_run_max_iterations_exceeded(
+        self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry
+    ) -> None:
         """If LLM keeps returning tool_calls, should hit max_iterations."""
         session = Session(tmp_path / "node")
         agent = AgentLoop(session, mock_registry, simple_tools, max_iterations=2, timeout=60)
 
         tool_resp = {
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [{
-                        "id": "tc1",
-                        "function": {"name": "echo", "arguments": '{"msg": "x"}'},
-                    }],
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "tc1",
+                                "function": {"name": "echo", "arguments": '{"msg": "x"}'},
+                            }
+                        ],
+                    }
                 }
-            }]
+            ]
         }
 
-        with patch.object(agent, "_call_llm", new=AsyncMock(return_value=tool_resp)), pytest.raises(RuntimeError, match="迭代次数达到上限"):
+        with (
+            patch.object(agent, "_call_llm", new=AsyncMock(return_value=tool_resp)),
+            pytest.raises(RuntimeError, match="迭代次数达到上限"),
+        ):
             asyncio.run(agent.run("system", "task"))
 
         # error.log should be written
@@ -205,6 +242,7 @@ class TestAgentLoopRun:
     def test_run_timeout(self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry) -> None:
         """If _call_llm takes longer than timeout, next loop check should raise."""
         import time as _time
+
         session = Session(tmp_path / "node")
         agent = AgentLoop(session, mock_registry, simple_tools, max_iterations=10, timeout=0.01)
 
@@ -214,22 +252,28 @@ class TestAgentLoopRun:
             while _time.monotonic() < deadline:
                 await asyncio.sleep(0.001)
             return {
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{
-                            "id": "tc1",
-                            "function": {"name": "echo", "arguments": '{"msg": "x"}'},
-                        }],
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "tc1",
+                                    "function": {"name": "echo", "arguments": '{"msg": "x"}'},
+                                }
+                            ],
+                        }
                     }
-                }]
+                ]
             }
 
         with patch.object(agent, "_call_llm", new=slow_llm_with_tools), pytest.raises(asyncio.TimeoutError):
             asyncio.run(agent.run("system", "task"))
 
-    def test_run_cancelled_saves_partial_turn(self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry) -> None:
+    def test_run_cancelled_saves_partial_turn(
+        self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry
+    ) -> None:
         """Cancel during loop should save partial turn."""
         session = Session(tmp_path / "node")
         agent = AgentLoop(session, mock_registry, simple_tools, max_iterations=5, timeout=60)
@@ -237,16 +281,20 @@ class TestAgentLoopRun:
         async def cancel_after_tool_resp():
             agent.cancel()
             return {
-                "choices": [{
-                    "message": {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [{
-                            "id": "tc1",
-                            "function": {"name": "echo", "arguments": '{"msg": "x"}'},
-                        }],
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": "",
+                            "tool_calls": [
+                                {
+                                    "id": "tc1",
+                                    "function": {"name": "echo", "arguments": '{"msg": "x"}'},
+                                }
+                            ],
+                        }
                     }
-                }]
+                ]
             }
 
         with patch.object(agent, "_call_llm", new=cancel_after_tool_resp), pytest.raises(asyncio.CancelledError):
@@ -263,24 +311,30 @@ class TestAgentLoopRun:
         agent = AgentLoop(session, mock_registry, simple_tools, max_iterations=5, timeout=60)
 
         tool_resp = {
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [{
-                        "id": "tc1",
-                        "function": {"name": "nonexistent", "arguments": "{}"},
-                    }],
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "tc1",
+                                "function": {"name": "nonexistent", "arguments": "{}"},
+                            }
+                        ],
+                    }
                 }
-            }]
+            ]
         }
         final_resp = {
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "handled",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "handled",
+                    }
                 }
-            }]
+            ]
         }
 
         with patch.object(agent, "_call_llm", new=AsyncMock(side_effect=[tool_resp, final_resp])):
@@ -296,24 +350,30 @@ class TestAgentLoopRun:
         agent = AgentLoop(session, mock_registry, simple_tools, max_iterations=5, timeout=60)
 
         tool_resp = {
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [{
-                        "id": "tc1",
-                        "function": {"name": "fail", "arguments": "{}"},
-                    }],
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "tc1",
+                                "function": {"name": "fail", "arguments": "{}"},
+                            }
+                        ],
+                    }
                 }
-            }]
+            ]
         }
         final_resp = {
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "recovered",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": "recovered",
+                    }
                 }
-            }]
+            ]
         }
 
         with patch.object(agent, "_call_llm", new=AsyncMock(side_effect=[tool_resp, final_resp])):
@@ -327,6 +387,7 @@ class TestAgentLoopRun:
 # ---------------------------------------------------------------------------
 # IPC events
 # ---------------------------------------------------------------------------
+
 
 class TestIPCEvents:
     def test_poll_interrupt(self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry) -> None:
@@ -353,8 +414,11 @@ class TestIPCEvents:
 # _seal_orphan_tool_calls
 # ---------------------------------------------------------------------------
 
+
 class TestSealOrphan:
-    def test_seals_when_last_is_assistant_with_tool_calls(self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry) -> None:
+    def test_seals_when_last_is_assistant_with_tool_calls(
+        self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry
+    ) -> None:
         agent = AgentLoop(Session(tmp_path / "node"), mock_registry, simple_tools)
         agent.messages = [
             {"role": "assistant", "content": "", "tool_calls": [{"id": "tc1"}]},
@@ -364,7 +428,9 @@ class TestSealOrphan:
         assert agent.messages[1]["role"] == "tool"
         assert agent.messages[1]["tool_call_id"] == "tc1"
 
-    def test_no_seal_when_already_has_result(self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry) -> None:
+    def test_no_seal_when_already_has_result(
+        self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry
+    ) -> None:
         agent = AgentLoop(Session(tmp_path / "node"), mock_registry, simple_tools)
         agent.messages = [
             {"role": "assistant", "content": "", "tool_calls": [{"id": "tc1"}]},
@@ -373,7 +439,9 @@ class TestSealOrphan:
         agent._seal_orphan_tool_calls()
         assert len(agent.messages) == 2
 
-    def test_no_seal_when_last_is_not_assistant(self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry) -> None:
+    def test_no_seal_when_last_is_not_assistant(
+        self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry
+    ) -> None:
         agent = AgentLoop(Session(tmp_path / "node"), mock_registry, simple_tools)
         agent.messages = [
             {"role": "user", "content": "hi"},
@@ -390,6 +458,7 @@ class TestSealOrphan:
 # ---------------------------------------------------------------------------
 # _msg_to_dict
 # ---------------------------------------------------------------------------
+
 
 class TestMsgToDict:
     def test_dict_passthrough(self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry) -> None:
@@ -413,8 +482,11 @@ class TestMsgToDict:
 # _call_llm fallback
 # ---------------------------------------------------------------------------
 
+
 class TestCallLLMFallback:
-    def test_fallback_on_fallbackable_error(self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry) -> None:
+    def test_fallback_on_fallbackable_error(
+        self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry
+    ) -> None:
         """Primary model fails with connection error, fallback succeeds."""
         reg = ModelRegistry()
         reg._models["default"] = ModelConfig(
@@ -435,15 +507,19 @@ class TestCallLLMFallback:
 
         agent = AgentLoop(Session(tmp_path / "node"), reg, simple_tools)
 
-        mock = AsyncMock(side_effect=[
-            OSError("connection refused"),
-            {"choices": [{"message": {"role": "assistant", "content": "fallback ok"}}]},
-        ])
+        mock = AsyncMock(
+            side_effect=[
+                OSError("connection refused"),
+                {"choices": [{"message": {"role": "assistant", "content": "fallback ok"}}]},
+            ]
+        )
         with patch.object(agent, "_call_llm_with_cfg", new=mock):
             result = asyncio.run(agent._call_llm())
             assert result["choices"][0]["message"]["content"] == "fallback ok"
 
-    def test_no_fallback_on_code_error(self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry) -> None:
+    def test_no_fallback_on_code_error(
+        self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry
+    ) -> None:
         """Code errors (e.g. ValueError) should not trigger fallback."""
         agent = AgentLoop(Session(tmp_path / "node"), mock_registry, simple_tools)
 
@@ -451,7 +527,9 @@ class TestCallLLMFallback:
         with patch.object(agent, "_call_llm_with_cfg", new=mock), pytest.raises(ValueError, match="bug"):
             asyncio.run(agent._call_llm())
 
-    def test_no_fallback_when_no_fallback_model(self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry) -> None:
+    def test_no_fallback_when_no_fallback_model(
+        self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry
+    ) -> None:
         """No fallback_model configured → error propagates."""
         agent = AgentLoop(Session(tmp_path / "node"), mock_registry, simple_tools)
 

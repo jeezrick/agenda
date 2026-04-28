@@ -31,6 +31,7 @@ from agenda.daemon import (
 # Path helpers
 # ---------------------------------------------------------------------------
 
+
 class TestPathHelpers:
     def test_pid_file(self, tmp_path: Path) -> None:
         assert _pid_file(tmp_path) == tmp_path / ".system" / "agenda.pid"
@@ -45,6 +46,7 @@ class TestPathHelpers:
 # ---------------------------------------------------------------------------
 # PID management
 # ---------------------------------------------------------------------------
+
 
 class TestPidManagement:
     def test_write_and_read_pid(self, tmp_path: Path) -> None:
@@ -75,6 +77,7 @@ class TestPidManagement:
 # ---------------------------------------------------------------------------
 # _is_running
 # ---------------------------------------------------------------------------
+
 
 class TestIsRunning:
     def test_no_pid_file(self, tmp_path: Path) -> None:
@@ -109,6 +112,7 @@ class TestIsRunning:
 # Lock management
 # ---------------------------------------------------------------------------
 
+
 class TestLockManagement:
     def test_acquire_and_release_lock(self, tmp_path: Path) -> None:
         # Ensure clean state
@@ -142,6 +146,7 @@ class TestLockManagement:
 # ---------------------------------------------------------------------------
 # NodeWatcher
 # ---------------------------------------------------------------------------
+
 
 class TestNodeWatcher:
     def test_init(self, tmp_path: Path) -> None:
@@ -189,9 +194,7 @@ class TestNodeWatcher:
 
             watcher = NodeWatcher(dag_dir, dag_file)
             watcher._scheduler = MagicMock()
-            watcher._scheduler.dag = {
-                "nodes": {"a": {"prompt": "task A"}}
-            }
+            watcher._scheduler.dag = {"nodes": {"a": {"prompt": "task A"}}}
             watcher._scheduler.nodes_dir = dag_dir / "nodes"
             watcher._scheduler.node_is_done.return_value = True
 
@@ -206,7 +209,8 @@ class TestNodeWatcher:
         dag_dir = tmp_path / "dag"
         dag_file = dag_dir / "dag.yaml"
         dag_dir.mkdir(parents=True, exist_ok=True)
-        dag_file.write_text("""
+        dag_file.write_text(
+            """
 dag:
   name: test
 nodes:
@@ -215,7 +219,9 @@ nodes:
   b:
     prompt: "task B"
     deps: [a]
-""", encoding="utf-8")
+""",
+            encoding="utf-8",
+        )
 
         watcher = NodeWatcher(dag_dir, dag_file)
         watcher._scheduler = MagicMock()
@@ -243,20 +249,21 @@ nodes:
         dag_dir = tmp_path / "dag"
         dag_file = dag_dir / "dag.yaml"
         dag_dir.mkdir(parents=True, exist_ok=True)
-        dag_file.write_text("""
+        dag_file.write_text(
+            """
 dag:
   name: test
 nodes:
   a:
     prompt: "task A"
     retries: 2
-""", encoding="utf-8")
+""",
+            encoding="utf-8",
+        )
 
         watcher = NodeWatcher(dag_dir, dag_file)
         watcher._scheduler = MagicMock()
-        watcher._scheduler.dag = {
-            "nodes": {"a": {"prompt": "task A", "retries": 2}}
-        }
+        watcher._scheduler.dag = {"nodes": {"a": {"prompt": "task A", "retries": 2}}}
         watcher._scheduler.nodes_dir = dag_dir / "nodes"
         watcher._scheduler.node_is_done.return_value = False
         watcher._scheduler.node_is_failed.return_value = True
@@ -291,6 +298,7 @@ nodes:
 # ---------------------------------------------------------------------------
 # CLI commands
 # ---------------------------------------------------------------------------
+
 
 class TestCmdStatus:
     def test_status_running(self, tmp_path: Path, monkeypatch) -> None:

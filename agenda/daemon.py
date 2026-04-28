@@ -107,6 +107,7 @@ def _is_running(dag_dir: Path) -> int | None:
 
 # ── NodeWatcher ─────────────────────────────────────────────────────────────
 
+
 class NodeWatcher:
     """扫描 DAG 节点目录，管理正在运行的节点 task。
 
@@ -224,6 +225,7 @@ class NodeWatcher:
 
 # ── Server core ─────────────────────────────────────────────────────────────
 
+
 async def _run(dag_dir: Path, dag_file: Path) -> None:
     """Daemon 主循环。"""
     dag_dir.mkdir(parents=True, exist_ok=True)
@@ -253,7 +255,8 @@ async def _run(dag_dir: Path, dag_file: Path) -> None:
 
     try:
         done, pending = await asyncio.wait(
-            tasks, return_when=asyncio.FIRST_EXCEPTION,
+            tasks,
+            return_when=asyncio.FIRST_EXCEPTION,
         )
         for p in pending:
             p.cancel()
@@ -285,9 +288,12 @@ def _start_daemon(dag_dir: Path, dag_file: Path) -> int:
     dag_dir.mkdir(parents=True, exist_ok=True)
 
     cmd = [
-        sys.executable, "-m", "agenda.daemon",
+        sys.executable,
+        "-m",
+        "agenda.daemon",
         "--foreground",
-        "--dag-dir", str(dag_dir),
+        "--dag-dir",
+        str(dag_dir),
     ]
     lf = _log_file(dag_dir)
     lf.parent.mkdir(parents=True, exist_ok=True)
@@ -349,18 +355,16 @@ def _cmd_status(dag_dir: Path) -> int:
 
 # ── CLI entry ───────────────────────────────────────────────────────────────
 
+
 def main() -> int:
     import argparse
 
     parser = argparse.ArgumentParser(
         description="Agenda daemon — 长期运行节点调度",
     )
-    parser.add_argument("--foreground", action="store_true",
-                        help="Run in foreground (don't daemonize)")
-    parser.add_argument("--dag-dir", type=str, default=str(Path.cwd()),
-                        help="DAG directory to watch")
-    parser.add_argument("command", nargs="?", choices=["start", "stop", "status"],
-                        help="Daemon command")
+    parser.add_argument("--foreground", action="store_true", help="Run in foreground (don't daemonize)")
+    parser.add_argument("--dag-dir", type=str, default=str(Path.cwd()), help="DAG directory to watch")
+    parser.add_argument("command", nargs="?", choices=["start", "stop", "status"], help="Daemon command")
 
     args = parser.parse_args()
     dag_dir = Path(args.dag_dir).resolve()

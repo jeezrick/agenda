@@ -30,3 +30,4 @@ Thumbs.db
 # Agenda workspace
 workspace/
 reference/
+.coverage

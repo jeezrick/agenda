@@ -16,24 +16,25 @@ from agenda.tools import build_tools
 
 def _patch_agent_run(monkeypatch, results: dict[str, str] | None = None) -> None:
     """Patch AgentLoop.run to return results directly without LLM calls."""
+
     async def mock_run(self: AgentLoop, system_prompt: str, task: str) -> str:
         if results and self.node_id in results:
             return results[self.node_id]
         return "done"
+
     monkeypatch.setattr(AgentLoop, "run", mock_run)
 
 
 def _patch_agent_run_with_agenda(monkeypatch) -> None:
     """Patch AgentLoop.run so that the first call executes agenda() then returns."""
+
     async def mock_run(self: AgentLoop, system_prompt: str, task: str) -> str:
         agenda_tool = self.tools.get("agenda")
         if agenda_tool and "delegate" in task.lower():
-            child_dag = (
-                "dag:\n  name: child\n"
-                "nodes:\n  child_a:\n    prompt: child task\n"
-            )
+            child_dag = "dag:\n  name: child\nnodes:\n  child_a:\n    prompt: child task\n"
             await agenda_tool(dag_yaml=child_dag)
         return "done after agenda"
+
     monkeypatch.setattr(AgentLoop, "run", mock_run)
 
 
@@ -107,8 +108,16 @@ class TestAgendaRecursion:
 
         # Child DAG Base Case should have created its node dir
         child_output = (
-            tmp_path / "test" / "nodes" / "parent" / "workspace" / "subdags"
-            / "nodes" / "child_a" / "output" / "draft.md"
+            tmp_path
+            / "test"
+            / "nodes"
+            / "parent"
+            / "workspace"
+            / "subdags"
+            / "nodes"
+            / "child_a"
+            / "output"
+            / "draft.md"
         )
         assert child_output.exists()
         assert child_output.read_text() == "done after agenda"
@@ -179,9 +188,7 @@ class TestDepInputsRouting:
                 "consumer": {
                     "prompt": "consume data",
                     "deps": ["producer"],
-                    "dep_inputs": [
-                        {"from": "nodes/producer/output/draft.md", "to": "producer_result.md"}
-                    ],
+                    "dep_inputs": [{"from": "nodes/producer/output/draft.md", "to": "producer_result.md"}],
                 },
             },
         }

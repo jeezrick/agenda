@@ -15,6 +15,7 @@ try:
     import yaml
 except ImportError:
     import sys
+
     print("[错误] 需要安装 PyYAML: pip install pyyaml")
     sys.exit(1)
 
@@ -240,7 +241,7 @@ class DAGScheduler:
         # 5. 写 hints
         hints = f"""# DAG 任务: {node_id}
 ## 提示
-{config.get('prompt', '')}{files_section}{dep_section}
+{config.get("prompt", "")}{files_section}{dep_section}
 ## 规则
 - 用 read_file / write_file 工具操作文件
 - 按需读取 input/ 下的内容，不要一次性加载所有
@@ -413,8 +414,7 @@ class DAGScheduler:
 
         self._save_scheduler_state()
         return {
-            n: ("COMPLETED" if n in self.completed else "FAILED" if n in self.failed else "PENDING")
-            for n in node_ids
+            n: ("COMPLETED" if n in self.completed else "FAILED" if n in self.failed else "PENDING") for n in node_ids
         }
 
     def cancel(self) -> None:
@@ -518,4 +518,3 @@ class DAGScheduler:
                 shutil.copy(src, dst)
         else:
             shutil.copy(src, dst)
-

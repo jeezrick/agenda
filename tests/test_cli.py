@@ -20,6 +20,7 @@ from agenda.const import (
 # Helpers
 # ---------------------------------------------------------------------------
 
+
 def _run_cli(argv: list[str], monkeypatch, capsys) -> tuple[int, dict]:
     """Run cli() with mocked sys.argv, return (exit_code, parsed_json_output)."""
     monkeypatch.setattr(sys, "argv", ["agenda"] + argv)
@@ -37,7 +38,8 @@ def sample_dag(tmp_path: Path) -> Path:
     dag_dir = tmp_path / "mydag"
     dag_dir.mkdir()
     dag_file = dag_dir / "dag.yaml"
-    dag_file.write_text("""
+    dag_file.write_text(
+        """
 dag:
   name: test
   max_parallel: 2
@@ -48,7 +50,9 @@ nodes:
   b:
     prompt: "task B"
     deps: [a]
-""", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
     return dag_dir
 
 
@@ -56,7 +60,8 @@ nodes:
 def cyclic_dag(tmp_path: Path) -> Path:
     dag_dir = tmp_path / "cyclic"
     dag_dir.mkdir()
-    (dag_dir / "dag.yaml").write_text("""
+    (dag_dir / "dag.yaml").write_text(
+        """
 dag:
   name: cyclic
 nodes:
@@ -66,7 +71,9 @@ nodes:
   y:
     prompt: "y"
     deps: [x]
-""", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
     return dag_dir
 
 
@@ -75,20 +82,24 @@ def bad_dep_dag(tmp_path: Path) -> Path:
     """DAG with a dep pointing to non-existent node."""
     dag_dir = tmp_path / "baddep"
     dag_dir.mkdir()
-    (dag_dir / "dag.yaml").write_text("""
+    (dag_dir / "dag.yaml").write_text(
+        """
 dag:
   name: bad
 nodes:
   a:
     prompt: "a"
     deps: [ghost]
-""", encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
     return dag_dir
 
 
 # ---------------------------------------------------------------------------
 # dag validate
 # ---------------------------------------------------------------------------
+
 
 class TestValidate:
     def test_valid_dag(self, sample_dag: Path, monkeypatch, capsys) -> None:
@@ -128,6 +139,7 @@ class TestValidate:
 # dag init
 # ---------------------------------------------------------------------------
 
+
 class TestInit:
     def test_init_creates_files(self, tmp_path: Path, monkeypatch, capsys) -> None:
         target = tmp_path / "newproj"
@@ -148,6 +160,7 @@ class TestInit:
 # ---------------------------------------------------------------------------
 # dag status
 # ---------------------------------------------------------------------------
+
 
 class TestStatus:
     def test_status_empty(self, sample_dag: Path, monkeypatch, capsys) -> None:
@@ -175,6 +188,7 @@ class TestStatus:
 # dag run --dry-run
 # ---------------------------------------------------------------------------
 
+
 class TestDryRun:
     def test_dry_run(self, sample_dag: Path, monkeypatch, capsys) -> None:
         code, data = _run_cli(["dag", "run", str(sample_dag), "--dry-run"], monkeypatch, capsys)
@@ -187,6 +201,7 @@ class TestDryRun:
 # ---------------------------------------------------------------------------
 # dag create
 # ---------------------------------------------------------------------------
+
 
 class TestCreate:
     def test_create_from_json(self, tmp_path: Path, monkeypatch, capsys) -> None:
@@ -202,6 +217,7 @@ class TestCreate:
 # ---------------------------------------------------------------------------
 # models
 # ---------------------------------------------------------------------------
+
 
 class TestModels:
     def test_models_list(self, monkeypatch, capsys) -> None:
@@ -231,6 +247,7 @@ class TestModels:
 # ---------------------------------------------------------------------------
 # node reset / logs
 # ---------------------------------------------------------------------------
+
 
 class TestNode:
     def test_reset_existing(self, sample_dag: Path, monkeypatch, capsys) -> None:
@@ -265,11 +282,13 @@ class TestNode:
 # _validate_dag internal
 # ---------------------------------------------------------------------------
 
+
 class TestValidateInternal:
     def test_dep_inputs_missing_output(self, tmp_path: Path) -> None:
         dag_dir = tmp_path / "badinput"
         dag_dir.mkdir()
-        (dag_dir / "dag.yaml").write_text("""
+        (dag_dir / "dag.yaml").write_text(
+            """
 dag:
   name: x
 nodes:
@@ -278,7 +297,9 @@ nodes:
     dep_inputs:
       - from: "nodes/b/output/draft.md"
         to: "deps/b.md"
-""", encoding="utf-8")
+""",
+            encoding="utf-8",
+        )
         scheduler = _load_scheduler(dag_dir)
         errors, warnings = _validate_dag(scheduler)
         # from path does not contain output/ ... wait it does. Let's test a bad one.
@@ -287,7 +308,8 @@ nodes:
     def test_dep_inputs_missing_fields(self, tmp_path: Path) -> None:
         dag_dir = tmp_path / "badinput"
         dag_dir.mkdir()
-        (dag_dir / "dag.yaml").write_text("""
+        (dag_dir / "dag.yaml").write_text(
+            """
 dag:
   name: x
 nodes:
@@ -296,7 +318,9 @@ nodes:
     dep_inputs:
       - from: ""
         to: "deps/b.md"
-""", encoding="utf-8")
+""",
+            encoding="utf-8",
+        )
         scheduler = _load_scheduler(dag_dir)
         errors, warnings = _validate_dag(scheduler)
         assert any("缺少 from" in e for e in errors)
@@ -304,14 +328,17 @@ nodes:
     def test_model_resolution(self, tmp_path: Path) -> None:
         dag_dir = tmp_path / "mod"
         dag_dir.mkdir()
-        (dag_dir / "dag.yaml").write_text("""
+        (dag_dir / "dag.yaml").write_text(
+            """
 dag:
   name: m
 nodes:
   a:
     prompt: "a"
     model: nonexistent_alias_xyz
-""", encoding="utf-8")
+""",
+            encoding="utf-8",
+        )
         scheduler = _load_scheduler(dag_dir)
         errors, warnings = _validate_dag(scheduler)
         # Should warn about unknown model, not error
@@ -321,6 +348,7 @@ nodes:
 # ---------------------------------------------------------------------------
 # guide
 # ---------------------------------------------------------------------------
+
 
 class TestGuide:
     def test_guide_default(self, monkeypatch, capsys) -> None:
@@ -355,6 +383,7 @@ class TestGuide:
 # run (quick single-node)
 # ---------------------------------------------------------------------------
 
+
 class TestRunQuick:
     def test_run_quick_dry_build(self, monkeypatch, capsys, tmp_path: Path) -> None:
         """Test that run builds a single-node DAG and workspace correctly."""
@@ -364,13 +393,23 @@ class TestRunQuick:
         monkeypatch.setattr("agenda.agenda", mock_agenda)
 
         out_dir = tmp_path / "quick-test"
-        monkeypatch.setattr(sys, "argv", [
-            "agenda", "run", "hello world",
-            "--model", "deepseek-flash",
-            "--output-dir", str(out_dir),
-            "--max-iterations", "10",
-            "--timeout", "30",
-        ])
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "agenda",
+                "run",
+                "hello world",
+                "--model",
+                "deepseek-flash",
+                "--output-dir",
+                str(out_dir),
+                "--max-iterations",
+                "10",
+                "--timeout",
+                "30",
+            ],
+        )
         code = cli()
         captured = capsys.readouterr()
         # When mock succeeds, output may be empty because print happens before _json_out in mock path... actually our code prints JSON at the end
@@ -393,11 +432,18 @@ class TestRunQuick:
         mock_agenda = AsyncMock(return_value={"task": "COMPLETED"})
         monkeypatch.setattr("agenda.agenda", mock_agenda)
 
-        monkeypatch.setattr(sys, "argv", [
-            "agenda", "run", "hello",
-            "--ephemeral",
-            "--output-dir", str(tmp_path / "ephemeral-test"),
-        ])
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "agenda",
+                "run",
+                "hello",
+                "--ephemeral",
+                "--output-dir",
+                str(tmp_path / "ephemeral-test"),
+            ],
+        )
         code = cli()
         captured = capsys.readouterr()
         lines = captured.out.strip().splitlines()
@@ -415,10 +461,17 @@ class TestRunQuick:
         mock_agenda = AsyncMock(return_value={"task": "FAILED"})
         monkeypatch.setattr("agenda.agenda", mock_agenda)
 
-        monkeypatch.setattr(sys, "argv", [
-            "agenda", "run", "hello",
-            "--output-dir", str(tmp_path / "fail-test"),
-        ])
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "agenda",
+                "run",
+                "hello",
+                "--output-dir",
+                str(tmp_path / "fail-test"),
+            ],
+        )
         code = cli()
         captured = capsys.readouterr()
         lines = captured.out.strip().splitlines()
@@ -438,11 +491,19 @@ class TestRunQuick:
         input_file.write_text("source content", encoding="utf-8")
         out_dir = tmp_path / "input-test"
 
-        monkeypatch.setattr(sys, "argv", [
-            "agenda", "run", "read the file",
-            "--output-dir", str(out_dir),
-            "--input-file", str(input_file),
-        ])
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "agenda",
+                "run",
+                "read the file",
+                "--output-dir",
+                str(out_dir),
+                "--input-file",
+                str(input_file),
+            ],
+        )
         code = cli()
         assert code == EXIT_SUCCESS
         # Check file was copied
@@ -450,11 +511,19 @@ class TestRunQuick:
 
     def test_run_quick_missing_input_file(self, monkeypatch, capsys, tmp_path: Path) -> None:
         """Test missing input file returns args error."""
-        monkeypatch.setattr(sys, "argv", [
-            "agenda", "run", "hello",
-            "--output-dir", str(tmp_path / "missing"),
-            "--input-file", "/does/not/exist.txt",
-        ])
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "agenda",
+                "run",
+                "hello",
+                "--output-dir",
+                str(tmp_path / "missing"),
+                "--input-file",
+                "/does/not/exist.txt",
+            ],
+        )
         code = cli()
         captured = capsys.readouterr()
         lines = captured.out.strip().splitlines()
@@ -471,10 +540,17 @@ class TestRunQuick:
         monkeypatch.setattr("agenda.agenda", mock_agenda)
 
         out_dir = tmp_path / "preview-test"
-        monkeypatch.setattr(sys, "argv", [
-            "agenda", "run", "write something",
-            "--output-dir", str(out_dir),
-        ])
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            [
+                "agenda",
+                "run",
+                "write something",
+                "--output-dir",
+                str(out_dir),
+            ],
+        )
         cli()
 
         # Manually write output to simulate agent completion
@@ -491,6 +567,7 @@ class TestRunQuick:
 # ---------------------------------------------------------------------------
 # Exit codes
 # ---------------------------------------------------------------------------
+
 
 class TestExitCodes:
     def test_no_args(self, monkeypatch, capsys) -> None:

@@ -9,6 +9,7 @@ from agenda.session import Session
 # Construction
 # ---------------------------------------------------------------------------
 
+
 class TestConstruction:
     def test_directories_created(self, tmp_path: Path) -> None:
         s = Session(tmp_path / "node1")
@@ -31,6 +32,7 @@ class TestConstruction:
 # ---------------------------------------------------------------------------
 # Agent-visible file ops
 # ---------------------------------------------------------------------------
+
 
 class TestAgentFileOps:
     def test_write_file_to_output(self, tmp_path: Path) -> None:
@@ -114,6 +116,7 @@ class TestAgentFileOps:
 # System-private ops
 # ---------------------------------------------------------------------------
 
+
 class TestSystemOps:
     def test_write_and_read_system(self, tmp_path: Path) -> None:
         s = Session(tmp_path / "node")
@@ -133,6 +136,7 @@ class TestSystemOps:
 # ---------------------------------------------------------------------------
 # State persistence
 # ---------------------------------------------------------------------------
+
 
 class TestState:
     def test_set_and_get(self, tmp_path: Path) -> None:
@@ -171,6 +175,7 @@ class TestState:
 # Turn persistence
 # ---------------------------------------------------------------------------
 
+
 class TestTurnPersistence:
     def test_save_and_load_turns(self, tmp_path: Path) -> None:
         s = Session(tmp_path / "node")
@@ -187,26 +192,30 @@ class TestTurnPersistence:
 
     def test_load_turns_skips_corrupt_lines(self, tmp_path: Path) -> None:
         s = Session(tmp_path / "node")
-        s._turns_path.write_text("not json\n{\"valid\": true}\n")
+        s._turns_path.write_text('not json\n{"valid": true}\n')
         turns = s.load_turns()
         assert len(turns) == 1
         assert turns[0]["valid"] is True
 
     def test_replay_history(self, tmp_path: Path) -> None:
         s = Session(tmp_path / "node")
-        s.save_turn({
-            "type": "turn",
-            "messages": [
-                {"role": "user", "content": "hi"},
-                {"role": "assistant", "content": "hello"},
-            ],
-        })
-        s.save_turn({
-            "type": "turn",
-            "messages": [
-                {"role": "user", "content": "bye"},
-            ],
-        })
+        s.save_turn(
+            {
+                "type": "turn",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "hello"},
+                ],
+            }
+        )
+        s.save_turn(
+            {
+                "type": "turn",
+                "messages": [
+                    {"role": "user", "content": "bye"},
+                ],
+            }
+        )
         msgs = s.replay_history()
         assert len(msgs) == 3
         assert msgs[0]["content"] == "hi"
@@ -265,6 +274,7 @@ class TestTurnPersistence:
 # IPC events
 # ---------------------------------------------------------------------------
 
+
 class TestEvents:
     def test_append_and_poll(self, tmp_path: Path) -> None:
         s = Session(tmp_path / "node")
@@ -293,7 +303,7 @@ class TestEvents:
 
     def test_poll_skips_corrupt_lines(self, tmp_path: Path) -> None:
         s = Session(tmp_path / "node")
-        s._events_path.write_text("not json\n{\"type\": \"ok\"}\n")
+        s._events_path.write_text('not json\n{"type": "ok"}\n')
         events, _ = s.poll_events(offset=0)
         assert len(events) == 1
         assert events[0]["type"] == "ok"
@@ -325,6 +335,7 @@ class TestEvents:
 # Status checks
 # ---------------------------------------------------------------------------
 
+
 class TestStatusChecks:
     def test_output_exists(self, tmp_path: Path) -> None:
         s = Session(tmp_path / "node")
@@ -354,6 +365,7 @@ class TestStatusChecks:
 # ---------------------------------------------------------------------------
 # Child session
 # ---------------------------------------------------------------------------
+
 
 class TestChildSession:
     def test_child_session_creates_directories(self, tmp_path: Path) -> None:

@@ -15,6 +15,7 @@ from agenda.compaction import (
 # should_auto_compact
 # ---------------------------------------------------------------------------
 
+
 class TestShouldAutoCompact:
     def test_ratio_trigger(self) -> None:
         # Use a large max_context so reserved_context does not trigger
@@ -33,6 +34,7 @@ class TestShouldAutoCompact:
 # estimate_text_tokens
 # ---------------------------------------------------------------------------
 
+
 class TestEstimateTextTokens:
     """Token estimation with CJK-aware heuristic."""
 
@@ -47,14 +49,18 @@ class TestEstimateTextTokens:
         assert estimate_text_tokens(msgs) > 0
 
     def test_tool_calls_counted(self) -> None:
-        msgs = [{
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "id": "tc1",
-                "function": {"name": "read_file", "arguments": '{"path": "test"}'},
-            }],
-        }]
+        msgs = [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "function": {"name": "read_file", "arguments": '{"path": "test"}'},
+                    }
+                ],
+            }
+        ]
         result = estimate_text_tokens(msgs)
         assert result > 0
 
@@ -71,6 +77,7 @@ class TestEstimateTextTokens:
 # ---------------------------------------------------------------------------
 # SimpleCompaction.prepare
 # ---------------------------------------------------------------------------
+
 
 class TestCompactionPrepare:
     def test_basic_split(self) -> None:
@@ -155,6 +162,7 @@ class TestCompactionPrepare:
 # Tool pair integrity
 # ---------------------------------------------------------------------------
 
+
 class TestToolPairIntegrity:
     """Compaction must not split assistant(tool_use) / tool(tool_result) pairs."""
 
@@ -164,10 +172,12 @@ class TestToolPairIntegrity:
             {
                 "role": "assistant",
                 "content": "",
-                "tool_calls": [{
-                    "id": "tc1",
-                    "function": {"name": "read_file", "arguments": "{}"},
-                }],
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
             },
             {"role": "tool", "tool_call_id": "tc1", "content": "result"},
             {"role": "user", "content": "b"},
@@ -195,10 +205,12 @@ class TestToolPairIntegrity:
             {
                 "role": "assistant",
                 "content": "",
-                "tool_calls": [{
-                    "id": "tc1",
-                    "function": {"name": "read_file", "arguments": "{}"},
-                }],
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
             },
             {"role": "tool", "tool_call_id": "tc1", "content": "result"},
             {"role": "user", "content": "b"},
@@ -231,6 +243,7 @@ class TestToolPairIntegrity:
 # ---------------------------------------------------------------------------
 # SimpleCompaction.compact (async, requires mocked client)
 # ---------------------------------------------------------------------------
+
 
 class MockChoice:
     def __init__(self, content: str) -> None:

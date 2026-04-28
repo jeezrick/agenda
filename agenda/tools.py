@@ -22,6 +22,7 @@ class ToolRegistry:
             def decorator(f: ToolFunc) -> ToolFunc:
                 self._tools[name] = f
                 return f
+
             return decorator
         self._tools[name] = func
         return func
@@ -34,14 +35,16 @@ class ToolRegistry:
         schemas = []
         for name, func in self._tools.items():
             sig = self._infer_schema(func)
-            schemas.append({
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": (func.__doc__ or "").strip(),
-                    "parameters": sig,
-                },
-            })
+            schemas.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": (func.__doc__ or "").strip(),
+                        "parameters": sig,
+                    },
+                }
+            )
         return schemas
 
     def describe(self) -> str:
@@ -86,7 +89,6 @@ class ToolRegistry:
                 pschema["default"] = param.default
             props[pname] = pschema
         return {"type": "object", "properties": props, "required": required}
-
 
 
 def build_tools(session: Session, allow_shell: bool = False) -> ToolRegistry:
@@ -143,4 +145,3 @@ def build_tools(session: Session, allow_shell: bool = False) -> ToolRegistry:
                 return f"[错误] {type(e).__name__}: {e}"
 
     return tools
-

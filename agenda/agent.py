@@ -147,7 +147,9 @@ class AgentLoop:
                         if details and "reasoning_tokens" in details:
                             cache_info += f" reasoning={details['reasoning_tokens']}"
                     if cache_info:
-                        print(f"  [Usage] in={usage.get('prompt_tokens')} out={usage.get('completion_tokens')}{cache_info}")
+                        print(
+                            f"  [Usage] in={usage.get('prompt_tokens')} out={usage.get('completion_tokens')}{cache_info}"
+                        )
 
                 msg = choice["message"]
                 msg_dict = self._msg_to_dict(msg)
@@ -156,12 +158,14 @@ class AgentLoop:
                 # 完成信号
                 if not msg_dict.get("tool_calls"):
                     # 一轮完整结束，save_turn
-                    self.session.save_turn({
-                        "type": "turn",
-                        "messages": self.messages[turn_start_idx:],
-                        "iteration": iteration,
-                        "ts": datetime.now().isoformat(),
-                    })
+                    self.session.save_turn(
+                        {
+                            "type": "turn",
+                            "messages": self.messages[turn_start_idx:],
+                            "iteration": iteration,
+                            "ts": datetime.now().isoformat(),
+                        }
+                    )
                     result: str = msg_dict.get("content", "")
                     return result
 
@@ -177,12 +181,14 @@ class AgentLoop:
                     self.messages.append(tool_result)
 
                 # 发送 progress 事件到 IPC（让外部观察者知道进度）
-                self.session.append_event({
-                    "type": "progress",
-                    "node_id": self.node_id,
-                    "iteration": iteration,
-                    "tool": pending_tool_calls[-1]["function"]["name"] if pending_tool_calls else None,
-                })
+                self.session.append_event(
+                    {
+                        "type": "progress",
+                        "node_id": self.node_id,
+                        "iteration": iteration,
+                        "tool": pending_tool_calls[-1]["function"]["name"] if pending_tool_calls else None,
+                    }
+                )
 
             # 迭代次数超限
             raise RuntimeError(f"Agent 迭代次数达到上限 {self.max_iterations}")
@@ -217,10 +223,12 @@ class AgentLoop:
                 source = event.get("from", "unknown")
                 content = event.get("content", "")
                 print(f"  [IPC] 收到来自 {source} 的消息")
-                self.messages.append({
-                    "role": "user",
-                    "content": f"[{source}] {content}",
-                })
+                self.messages.append(
+                    {
+                        "role": "user",
+                        "content": f"[{source}] {content}",
+                    }
+                )
 
     # --- 内部方法 ---
 
@@ -254,12 +262,16 @@ class AgentLoop:
     def _is_fallbackable_error(self, exc: Exception) -> bool:
         """判断错误是否可 fallback（网络/服务端错误）。"""
         import openai
-        if isinstance(exc, (
-            openai.APIConnectionError,
-            openai.APITimeoutError,
-            openai.InternalServerError,
-            openai.RateLimitError,
-        )):
+
+        if isinstance(
+            exc,
+            (
+                openai.APIConnectionError,
+                openai.APITimeoutError,
+                openai.InternalServerError,
+                openai.RateLimitError,
+            ),
+        ):
             return True
         # OSError 包含连接错误
         return bool(isinstance(exc, OSError))
@@ -282,7 +294,24 @@ class AgentLoop:
 
         # OpenAI SDK 不识别 provider-specific 参数（如 DeepSeek 的 thinking/reasoning_effort），
         # 需要拆分到 extra_body 中透传。
-        standard_keys = {"model", "messages", "temperature", "max_tokens", "tools", "tool_choice", "stream", "stop", "top_p", "frequency_penalty", "presence_penalty", "logprobs", "top_logprobs", "response_format", "n", "user"}
+        standard_keys = {
+            "model",
+            "messages",
+            "temperature",
+            "max_tokens",
+            "tools",
+            "tool_choice",
+            "stream",
+            "stop",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "logprobs",
+            "top_logprobs",
+            "response_format",
+            "n",
+            "user",
+        }
         extra_body = {k: v for k, v in kwargs.items() if k not in standard_keys}
         standard_kwargs = {k: v for k, v in kwargs.items() if k in standard_keys}
         if extra_body:
@@ -322,10 +351,7 @@ class AgentLoop:
             return
         for tc in last["tool_calls"]:
             tc_id = tc.get("id", "")
-            has_result = any(
-                m.get("role") == "tool" and m.get("tool_call_id") == tc_id
-                for m in self.messages
-            )
+            has_result = any(m.get("role") == "tool" and m.get("tool_call_id") == tc_id for m in self.messages)
             if not has_result:
                 synthetic = {
                     "role": "tool",
@@ -347,9 +373,7 @@ class AgentLoop:
 
         for attempt in range(max_retries):
             try:
-                compactor = SimpleCompaction(
-                    max_preserved_messages=DEFAULT_COMPACTION_MAX_PRESERVED
-                )
+                compactor = SimpleCompaction(max_preserved_messages=DEFAULT_COMPACTION_MAX_PRESERVED)
                 compacted = await compactor.compact(
                     self.messages,
                     client=self._get_client(self.model_cfg),
@@ -364,12 +388,14 @@ class AgentLoop:
                 self.messages = list(compacted.messages)
                 self.session.clear_turns()
                 self.session.write_system_turn(system_prompt)
-                self.session.save_turn({
-                    "type": "turn",
-                    "messages": list(self.messages),
-                    "compact": True,
-                    "ts": datetime.now().isoformat(),
-                })
+                self.session.save_turn(
+                    {
+                        "type": "turn",
+                        "messages": list(self.messages),
+                        "compact": True,
+                        "ts": datetime.now().isoformat(),
+                    }
+                )
 
                 post_token_count = estimate_text_tokens(self.messages)
                 usage_info = ""
@@ -385,18 +411,13 @@ class AgentLoop:
             except Exception as e:
                 last_error = e
                 if attempt < max_retries - 1:
-                    delay = base_delay * (2 ** attempt) + random.uniform(0, 1)
-                    print(
-                        f"  [压缩重试 {attempt + 1}/{max_retries}] "
-                        f"{type(e).__name__}: {e}，{delay:.1f}s 后重试..."
-                    )
+                    delay = base_delay * (2**attempt) + random.uniform(0, 1)
+                    print(f"  [压缩重试 {attempt + 1}/{max_retries}] {type(e).__name__}: {e}，{delay:.1f}s 后重试...")
                     await asyncio.sleep(delay)
                 else:
                     break
 
-        raise RuntimeError(
-            f"记忆压缩失败（重试 {max_retries} 次）: {last_error}"
-        ) from last_error
+        raise RuntimeError(f"记忆压缩失败（重试 {max_retries} 次）: {last_error}") from last_error
 
     def _msg_to_dict(self, msg: Any) -> dict:
         """把 LLM 返回的消息对象转成 dict。"""
