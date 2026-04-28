@@ -2,14 +2,10 @@ from __future__ import annotations
 
 """工具注册表与工具工厂。"""
 
-import asyncio
 import inspect
-import json
-from typing import Any, Callable
+from collections.abc import Callable
 
 from .session import Session
-
-
 
 ToolFunc = Callable[..., str]
 
@@ -70,7 +66,6 @@ class ToolRegistry:
     @staticmethod
     def _infer_schema(func: ToolFunc) -> dict:
         """从函数签名简单推断 JSON Schema（支持常见类型标注）。"""
-        import inspect
         sig = inspect.signature(func)
         props: dict[str, dict] = {}
         required: list[str] = []

@@ -1,6 +1,6 @@
 # Context Compaction 调研报告
 
-> 调研五个项目中 Context Compaction（上下文压缩/记忆压缩）的实现方案对比。
+> 调研六个项目中 Context Compaction（上下文压缩/记忆压缩）的实现方案对比。
 
 ---
 
@@ -10,9 +10,10 @@
 2. [Claw Code](#2-claw-code)
 3. [Kimi CLI](#3-kimi-cli)
 4. [Claude Code](#4-claude-code)
-5. [Agenda](#5-agenda)
-6. [横向对比](#6-横向对比)
-7. [总结与建议](#7-总结与建议)
+5. [Codex](#5-codex)
+6. [Agenda](#6-agenda)
+7. [横向对比](#7-横向对比)
+8. [总结与建议](#8-总结与建议)
 
 ---
 
@@ -430,7 +431,126 @@ export function getAutoCompactThreshold(model: string): number {
 
 ---
 
-## 5. Agenda
+## 5. Codex
+
+### 状态：LLM 驱动 + 远程/本地双路径
+
+Codex (Rust) 的压缩系统采用 LLM 驱动的"Memento"策略，支持本地和远程两种实现路径。Compaction 被设计为一个与 RegularTask 并列的独立 `SessionTask`。
+
+### 核心文件
+
+- `codex-rs/core/src/compact.rs` — 本地内联压缩主逻辑（~586 行）
+- `codex-rs/core/src/compact_remote.rs` — 远程压缩路径
+- `codex-rs/core/src/tasks/compact.rs` — CompactTask 任务分发器
+- `codex-rs/core/templates/compact/prompt.md` — 压缩提示模板
+- `codex-rs/core/templates/compact/summary_prefix.md` — 摘要前缀
+- `codex-rs/core/src/context_manager/history.rs` — ContextManager 历史管理
+- `codex-rs/core/src/session/turn.rs` — `run_turn()` 中集成的压缩触发点
+- `codex-rs/codex-api/src/endpoint/compact.rs` — 远程压缩 API 端点
+
+### 架构总览
+
+```
+CompactTask::run()
+  ├─ should_use_remote_compact_task()?  ← 根据 provider 决定路径
+  │
+  ├─ [远程路径] run_remote_compact_task()
+  │     └─ 调用服务端 API 执行压缩
+  │
+  └─ [本地路径] run_compact_task()
+        ├─ 1. 发送 TurnStarted 事件
+        ├─ 2. run_compact_task_inner()
+        │    ├─ a. 发出 ContextCompactionItem
+        │    ├─ b. 构建 prompt = compact_prompt + history
+        │    ├─ c. drain_to_completed() — 调用 LLM（Responses API）
+        │    │     └─ 重试循环: ContextWindowExceeded → remove_first_item()
+        │    │                   stream error → backoff 重试（最多 max_retries）
+        │    │                   Interrupted → 立即返回
+        │    ├─ d. 从 LLM 输出提取 summary_text
+        │    ├─ e. 收集 user_messages（去重，排除摘要消息）
+        │    ├─ f. build_compacted_history() → 重建为摘要 + 精选用户消息
+        │    ├─ g. 根据 initial_context_injection 决定是否注入 initial context
+        │    └─ h. replace_compacted_history() + recompute_token_usage()
+        ├─ 3. 发出 Warning（提示长期线程可能降低精度）
+        └─ 4. CompactionAnalyticsAttempt 追踪
+```
+
+### 触发条件
+
+两处触发点，都在 `run_turn()` 中：
+
+**1. Pre-Sampling Compact（采样前）：**
+```
+total_usage_tokens >= auto_compact_limit
+→ InitialContextInjection::DoNotInject（下一轮重新注入）
+→ CompactionPhase::PreTurn
+```
+
+**2. Mid-Turn Compact（轮中）：**
+```
+token_limit_reached && needs_follow_up
+→ InitialContextInjection::BeforeLastUserMessage（注入到摘要前）
+→ CompactionPhase::MidTurn
+```
+
+额外触发：**Model Downshift** — 当切换到更小上下文窗口的模型时，用前一个模型做压缩。
+
+### 压缩提示模板
+
+```
+prompt.md:
+"You are performing a CONTEXT CHECKPOINT COMPACTION. Create a handoff summary
+ for another LLM that will resume the task.
+ Include:
+ - Current progress and key decisions made
+ - Important context, constraints, or user preferences
+ - What remains to be done (clear next steps)
+ - Any critical data, examples, or references needed to continue"
+
+summary_prefix.md:
+"Another language model started to solve this problem and produced a summary
+ of its thinking process. You also have access to the state of the tools that
+ were used by that language model. Use this to build on the work that has
+ already been done and avoid duplicating work. Here is the summary..."
+```
+
+### 压缩后的历史结构
+
+```rust
+fn build_compacted_history(initial_context, user_messages, summary_text):
+    // 1. 精选用户消息（从后往前选，最多 20K tokens）
+    // 2. 追加为 user-role ResponseItem::Message
+    // 3. 追加压缩摘要作为最后一条 user-role 消息
+    // → 返回 Vec<ResponseItem>
+```
+
+### InitialContextInjection 策略
+
+```rust
+enum InitialContextInjection {
+    BeforeLastUserMessage,  // Mid-turn：注入到最后一个真实用户消息前
+    DoNotInject,            // Pre-turn/manual：不注入，下一轮重新全量注入
+}
+```
+
+注入时按优先级找插入点：最后一个真实用户消息 > 最后一个用户类消息(含摘要) > 最后一个 Compaction item > 末尾追加。
+
+### 远程压缩
+
+当 `provider.supports_remote_compaction()` 返回 true 时，压缩任务完全卸载到服务端。本地只做触发和结果处理。
+
+### 关键特性
+
+- **双路径** — 本地 LLM vs 远程服务端，根据 provider 能力自动选择
+- **保留用户消息** — 在压缩后的历史中保留精选的用户消息（最多 20K tokens），不只是摘要
+- **上下文重注入** — 压缩后根据阶段决定是否立即注入 initial context
+- **逐步裁剪** — 遇到 ContextWindowExceeded 时从历史头部逐步移除旧消息
+- **可观测性** — CompactionAnalyticsAttempt 追踪前后 token 数、耗时、状态
+- **重压缩防护** — 用户消息收集时过滤已有的摘要消息（is_summary_message）
+
+---
+
+## 6. Agenda
 
 ### 状态：从 Kimi CLI 直接移植
 
@@ -470,33 +590,35 @@ DEFAULT_COMPACTION_RESERVED = 50_000
 
 ---
 
-## 6. 横向对比
+## 7. 横向对比
 
 ### 核心策略对比
 
-| 维度 | Butterfly | Claw Code | Kimi CLI | Claude Code | Agenda |
-|------|-----------|-----------|----------|-------------|--------|
-| **语言** | Python | Rust | Python | TypeScript | Python |
-| **压缩方法** | 标记替换 | 启发式提取 | LLM 摘要 | **4 层混合** | LLM 摘要 |
-| **使用 LLM?** | ❌ | ❌ | ✅ | **可选** (SM/MC 不调) | ✅ |
-| **额外 token 成本** | 无 | 无 | 有 | **有/无 双路径** | 有 |
-| **保留消息数** | 无 | 4 | 2 | **动态计算** | 2 |
-| **触发阈值** | 无 | 10K tokens | 85% + 50K | **contextWindow - 13K** | 75% + 2K |
+| 维度 | Butterfly | Claw Code | Kimi CLI | Claude Code | Codex | Agenda |
+|------|-----------|-----------|----------|-------------|-------|--------|
+| **语言** | Python | Rust | Python | TypeScript | Rust | Python |
+| **压缩方法** | 标记替换 | 启发式提取 | LLM 摘要 | **4 层混合** | LLM 摘要 | LLM 摘要 |
+| **使用 LLM?** | ❌ | ❌ | ✅ | **可选** (SM/MC 不调) | ✅ | ✅ |
+| **额外 token 成本** | 无 | 无 | 有 | **有/无 双路径** | 有 | 有 |
+| **保留消息数** | 无 | 4 | 2 | **动态计算** | 2 + 精选用户消息 | 2 |
+| **触发阈值** | 无 | 10K tokens | 85% + 50K | **contextWindow - 13K** | auto_compact_limit | 75% + 2K |
+| **远程压缩** | ❌ | ❌ | ❌ | ❌ | ✅ | ❌ |
 
 ### 工程特性对比
 
-| 特性 | Butterfly | Claw Code | Kimi CLI | Claude Code | Agenda |
-|------|-----------|-----------|----------|-------------|--------|
-| 🌳 **Tool 边界安全** | ❌ | ✅ | ❌ | **✅ 最完善** | ❌ |
-| 🔄 **重试机制** | ❌ | ❌ | 指数退避 3 次 | **PTL 3 + streaming 2 + 断路器** | ❌ |
-| 💰 **缓存利用** | ❌ | ❌ | ❌ | **forkedAgent cache 共享 + cache_edits API** | ❌ |
-| 📎 **附件恢复** | ❌ | ❌ | ❌ | **文件/Skill/Plan/Agent/工具增量** | ❌ |
-| 📊 **可观测性** | ❌ | ❌ | 线路事件 | **10+ 维度埋点** | ❌ |
-| 🎯 **自定义指令** | ❌ | ❌ | `/compact 保留...` | **PreCompact hook + 用户输入** | ❌ |
-| 🧩 **Partial compact** | ❌ | ❌ | ❌ | **两种方向 (from/up_to)** | ❌ |
-| 🏗 **二级压缩** | ❌ | ✅ 行优先级 | ❌ | **SM truncation + MC 清空** | ❌ |
-| 🛡 **重压缩防护** | ❌ | ✅ 合并摘要 | ❌ | **断路 + PTLA** | ❌ |
-| 📝 **后处理** | ❌ | ❌ | checkpoint 重建 | **附件恢复 + hooks** | rotate 文件 |
+| 特性 | Butterfly | Claw Code | Kimi CLI | Claude Code | Codex | Agenda |
+|------|-----------|-----------|----------|-------------|-------|--------|
+| 🌳 **Tool 边界安全** | ❌ | ✅ | ❌ | **✅ 最完善** | ✅ (normalize) | ❌ |
+| 🔄 **重试机制** | ❌ | ❌ | 指数退避 3 次 | **PTL 3 + streaming 2 + 断路器** | 指数退避 + 逐步裁剪 | ❌ |
+| 💰 **缓存利用** | ❌ | ❌ | ❌ | **forkedAgent cache 共享 + cache_edits API** | ❌ | ❌ |
+| 📎 **附件恢复** | ❌ | ❌ | ❌ | **文件/Skill/Plan/Agent/工具增量** | 精选用户消息重放 | ❌ |
+| 📊 **可观测性** | ❌ | ❌ | 线路事件 | **10+ 维度埋点** | Analytics Attempt (token 前后对比) | ❌ |
+| 🎯 **自定义指令** | ❌ | ❌ | `/compact 保留...` | **PreCompact hook + 用户输入** | compact_prompt 配置覆盖 | ❌ |
+| 🧩 **Partial compact** | ❌ | ❌ | ❌ | **两种方向 (from/up_to)** | ❌ | ❌ |
+| 🏗 **二级压缩** | ❌ | ✅ 行优先级 | ❌ | **SM truncation + MC 清空** | ❌ | ❌ |
+| 🛡 **重压缩防护** | ❌ | ✅ 合并摘要 | ❌ | **断路 + PTLA** | **is_summary_message 过滤** | ❌ |
+| 📝 **后处理** | ❌ | ❌ | checkpoint 重建 | **附件恢复 + hooks** | replace_compacted_history + token 重算 | rotate 文件 |
+| ☁️ **远程压缩** | ❌ | ❌ | ❌ | ❌ | **✅ 双路径** | ❌ |
 
 ### 代码量对比
 
@@ -506,11 +628,12 @@ DEFAULT_COMPACTION_RESERVED = 50_000
 | Claw Code | ~600 行 (compact.rs + summary_compression.rs) | Rust |
 | Kimi CLI | ~400 行 (compaction.py + compact.md) | Python |
 | Claude Code | **~2000 行** (compact/ 目录 18 个文件) | TypeScript |
+| Codex | ~1000 行 (compact.rs + compact_remote.rs + tasks/compact.rs + templates) | Rust |
 | Agenda | ~200 行 (compaction.py + compact.md) | Python |
 
 ---
 
-## 7. 总结与建议
+## 8. 总结与建议
 
 ### 各方案定位
 
@@ -520,19 +643,23 @@ DEFAULT_COMPACTION_RESERVED = 50_000
 | **Claw Code** | 重视成本、可接受信息损失 | 零成本启发式 |
 | **Kimi CLI** | 有限 LLM 调用、需要高质量摘要 | LLM 驱动 + 结构化输出 |
 | **Claude Code** | 生产级、多场景覆盖 | 4 层策略 + 完整工程防护 |
+| **Codex** | 远程/本地双环境、大规模部署 | 双路径 + 精选用户消息保留 |
 | **Agenda** | 极简核心、快速验证 | Kimi 子集 |
 
 ### Agenda 可改进的方向
 
 基于本次调研，Agenda 的 `SimpleCompaction` 有以下可改进点：
 
-1. **Tool 边界安全** — Claw Code / Claude Code 都有的功能，防止拆分 tool_use/tool_result 对
-2. **重试机制** — Kimi CLI 有的指数退避重试，Agenda 缺失
-3. **重压缩合并** — 多次压缩时旧摘要不丢失（Claw Code 的 merge + Claude Code 的 RecompactionInfo）
-4. **估算改进** — Agenda 和 Kimi 都用的 `len//4` 启发式，对中文偏差大
-5. **自定义指令** — Kimi CLI 和 Claude Code 都支持，Agenda 缺
-6. **可观测性** — 至少可以加压缩前后 token 数的日志
+1. **Tool 边界安全** — Claw Code / Claude Code / Codex 都有的功能，防止拆分 tool_use/tool_result 对
+2. **重试机制** — Kimi CLI 有的指数退避重试，Codex 有完善的 ContextWindowExceeded 逐步裁剪重试，Agenda 缺失
+3. **重压缩合并** — 多次压缩时旧摘要不丢失（Claw Code 的 merge + Claude Code 的 RecompactionInfo + Codex 的 is_summary_message 过滤）
+4. **估算改进** — Agenda 和 Kimi 都用的 `len//4` 启发式，对中文偏差大；Codex 用 `approx_token_count` 基于字节的启发式
+5. **自定义指令** — Kimi CLI 和 Claude Code 都支持，Codex 支持 compact_prompt 配置覆盖，Agenda 缺
+6. **可观测性** — 至少可以加压缩前后 token 数的日志（Codex 的 CompactionAnalyticsAttempt 模式）
+7. **精选用户消息保留** — Codex 在压缩后保留精选用户消息（最多 20K tokens），而非仅摘要，这提供了更多的上下文连续性
 
 ### 长远方向
 
 Session Memory Compaction（Claude Code 的策略 1）是理论上最优方案——独立于压缩之外的记忆系统持续提取关键信息，压缩时直接复用。这避免了压缩时的额外 LLM 调用，同时记忆系统本身也是其他场景的有用基础设施。但实现成本高，适合项目成熟期考虑。
+
+Codex 的远程压缩（将压缩卸载到服务端）和精选用户消息保留策略也是值得参考的方向——前者降低了客户端资源消耗，后者在压缩后提供了比纯摘要更丰富的上下文。

@@ -38,6 +38,47 @@ agenda = "agenda:cli"
 testpaths = ["tests"]
 addopts = "--ignore=reference"
 
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+lint.select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # Pyflakes
+    "I",   # isort
+    "N",   # pep8-naming
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+]
+lint.ignore = [
+    "E501",  # line too long (handled by formatter)
+    "E402",  # module import not at top (docstrings are normal)
+    "N806",  # variable in function should be lowercase (constants like WHITE/GRAY/BLACK are fine)
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+skip-magic-trailing-comma = false
+line-ending = "auto"
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+show_error_codes = true
+ignore_missing_imports = true
+
 [project.urls]
 Homepage = "https://github.com/jeezrick/agenda"
 Repository = "https://github.com/jeezrick/agenda"

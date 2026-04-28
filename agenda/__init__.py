@@ -17,25 +17,24 @@
 
 __version__ = "0.0.6"
 
-import asyncio
 from pathlib import Path
 from typing import Any
 
+from .agent import AgentLoop
+from .cli import cli
 from .const import (
-    EXIT_SUCCESS,
     EXIT_ARGS_ERROR,
     EXIT_DAG_CONFIG_ERROR,
-    EXIT_EXECUTION_ERROR,
     EXIT_DEPENDENCY_ERROR,
+    EXIT_EXECUTION_ERROR,
+    EXIT_SUCCESS,
 )
-from .models import ModelConfig, ModelRegistry
+from .daemon import NodeWatcher
 from .guardian import Guardian
+from .models import ModelConfig, ModelRegistry
+from .scheduler import DAGScheduler
 from .session import Session
 from .tools import ToolRegistry, build_tools
-from .agent import AgentLoop
-from .scheduler import DAGScheduler
-from .daemon import NodeWatcher
-from .cli import cli
 
 
 async def agenda(

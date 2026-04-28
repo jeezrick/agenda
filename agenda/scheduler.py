@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import re
 import shutil
 import traceback
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
 
 try:
     import yaml
@@ -19,11 +18,10 @@ except ImportError:
     print("[错误] 需要安装 PyYAML: pip install pyyaml")
     sys.exit(1)
 
-from .const import DEFAULT_MAX_ITERATIONS, DEFAULT_NODE_TIMEOUT, DEFAULT_MAX_RETRIES, MAX_SUB_AGENT_DEPTH
-from .session import Session
+from .const import DEFAULT_MAX_RETRIES
 from .models import ModelRegistry
-from .agent import AgentLoop
-from .tools import ToolRegistry, build_tools
+from .session import Session
+from .tools import ToolRegistry
 
 
 class DAGScheduler:
@@ -84,7 +82,7 @@ class DAGScheduler:
 
     def node_is_running(self, node_id: str) -> bool:
         state = Session(self.nodes_dir / node_id).get_state("status")
-        return state == "running"
+        return bool(state == "running")
 
     # --- 调度状态持久化 ---
 
@@ -121,7 +119,7 @@ class DAGScheduler:
         """DFS 环检测。返回环中的节点列表，无环返回 None。"""
         nodes = self.dag.get("nodes", {})
         WHITE, GRAY, BLACK = 0, 1, 2
-        color = {n: WHITE for n in nodes}
+        color = dict.fromkeys(nodes, WHITE)
         path: list[str] = []
 
         def dfs(node: str) -> list[str] | None:
@@ -154,8 +152,8 @@ class DAGScheduler:
         from collections import deque
 
         nodes = self.dag.get("nodes", {})
-        in_degree = {n: 0 for n in nodes}
-        adj = {n: [] for n in nodes}
+        in_degree = dict.fromkeys(nodes, 0)
+        adj: dict[str, list[str]] = {n: [] for n in nodes}
         for n, cfg in nodes.items():
             for dep in cfg.get("deps", []):
                 if dep in adj:
@@ -364,7 +362,7 @@ class DAGScheduler:
                 remaining = set(node_ids) - self.completed - self.failed
                 blocked = {n for n in remaining if any(d in self.failed for d in self.dag["nodes"][n].get("deps", []))}
                 if blocked == remaining:
-                    print(f"[DAG] 所有剩余节点被失败节点阻塞，终止")
+                    print("[DAG] 所有剩余节点被失败节点阻塞，终止")
                     break
 
             # 死锁检测
@@ -406,7 +404,7 @@ class DAGScheduler:
         # 等待所有 pending 任务完成
         if pending_tasks:
             await asyncio.gather(*pending_tasks.values(), return_exceptions=True)
-            for n, t in pending_tasks.items():
+            for n, _t in pending_tasks.items():
                 self.running.discard(n)
                 if self.node_is_done(n):
                     self.completed.add(n)
@@ -425,7 +423,7 @@ class DAGScheduler:
 
     def _infer_depth(self, session: Session) -> int:
         """从 session state 读取当前递归深度。"""
-        return session.get_state("agenda_depth", 0)
+        return int(session.get_state("agenda_depth", 0))
 
     async def _run_node(
         self,
@@ -507,10 +505,7 @@ class DAGScheduler:
         if not src.exists():
             return
 
-        if dst_rel is not None:
-            dst = dst_dir / dst_rel.lstrip("/")
-        else:
-            dst = dst_dir / path.lstrip("/")
+        dst = dst_dir / dst_rel.lstrip("/") if dst_rel is not None else dst_dir / path.lstrip("/")
         dst.parent.mkdir(parents=True, exist_ok=True)
 
         if section:

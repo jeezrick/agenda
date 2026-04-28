@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
-from datetime import datetime
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -14,7 +12,6 @@ from agenda.agent import AgentLoop
 from agenda.models import ModelConfig, ModelRegistry
 from agenda.session import Session
 from agenda.tools import ToolRegistry
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -199,9 +196,8 @@ class TestAgentLoopRun:
             }]
         }
 
-        with patch.object(agent, "_call_llm", new=AsyncMock(return_value=tool_resp)):
-            with pytest.raises(RuntimeError, match="迭代次数达到上限"):
-                asyncio.run(agent.run("system", "task"))
+        with patch.object(agent, "_call_llm", new=AsyncMock(return_value=tool_resp)), pytest.raises(RuntimeError, match="迭代次数达到上限"):
+            asyncio.run(agent.run("system", "task"))
 
         # error.log should be written
         assert session.is_failed()
@@ -230,9 +226,8 @@ class TestAgentLoopRun:
                 }]
             }
 
-        with patch.object(agent, "_call_llm", new=slow_llm_with_tools):
-            with pytest.raises(asyncio.TimeoutError):
-                asyncio.run(agent.run("system", "task"))
+        with patch.object(agent, "_call_llm", new=slow_llm_with_tools), pytest.raises(asyncio.TimeoutError):
+            asyncio.run(agent.run("system", "task"))
 
     def test_run_cancelled_saves_partial_turn(self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry) -> None:
         """Cancel during loop should save partial turn."""
@@ -254,9 +249,8 @@ class TestAgentLoopRun:
                 }]
             }
 
-        with patch.object(agent, "_call_llm", new=cancel_after_tool_resp):
-            with pytest.raises(asyncio.CancelledError):
-                asyncio.run(agent.run("system", "task"))
+        with patch.object(agent, "_call_llm", new=cancel_after_tool_resp), pytest.raises(asyncio.CancelledError):
+            asyncio.run(agent.run("system", "task"))
 
         # partial turn should be saved
         turns = session.load_turns()
@@ -454,15 +448,13 @@ class TestCallLLMFallback:
         agent = AgentLoop(Session(tmp_path / "node"), mock_registry, simple_tools)
 
         mock = AsyncMock(side_effect=ValueError("bug"))
-        with patch.object(agent, "_call_llm_with_cfg", new=mock):
-            with pytest.raises(ValueError, match="bug"):
-                asyncio.run(agent._call_llm())
+        with patch.object(agent, "_call_llm_with_cfg", new=mock), pytest.raises(ValueError, match="bug"):
+            asyncio.run(agent._call_llm())
 
     def test_no_fallback_when_no_fallback_model(self, tmp_path: Path, mock_registry: ModelRegistry, simple_tools: ToolRegistry) -> None:
         """No fallback_model configured → error propagates."""
         agent = AgentLoop(Session(tmp_path / "node"), mock_registry, simple_tools)
 
         mock = AsyncMock(side_effect=OSError("connection refused"))
-        with patch.object(agent, "_call_llm_with_cfg", new=mock):
-            with pytest.raises(OSError, match="connection refused"):
-                asyncio.run(agent._call_llm())
+        with patch.object(agent, "_call_llm_with_cfg", new=mock), pytest.raises(OSError, match="connection refused"):
+            asyncio.run(agent._call_llm())

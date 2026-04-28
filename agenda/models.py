@@ -5,8 +5,8 @@ from __future__ import annotations
 import os
 import re
 import sys
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path
 
 try:
     import yaml
@@ -14,11 +14,6 @@ except ImportError:
     print("[错误] 需要安装 PyYAML: pip install pyyaml")
     sys.exit(1)
 
-from .const import (
-    DEFAULT_MAX_ITERATIONS,
-    DEFAULT_NODE_TIMEOUT,
-    MAX_SUB_AGENT_DEPTH,
-)
 
 
 @dataclass

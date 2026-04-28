@@ -12,14 +12,15 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .agent import AgentLoop
+from .const import DEFAULT_MAX_ITERATIONS, DEFAULT_NODE_TIMEOUT, MAX_SUB_AGENT_DEPTH
 from .scheduler import DAGScheduler
 from .session import Session
 from .tools import ToolRegistry
-from .const import DEFAULT_MAX_ITERATIONS, DEFAULT_NODE_TIMEOUT, MAX_SUB_AGENT_DEPTH
 
 
 async def run_agent_node(
@@ -47,7 +48,7 @@ async def run_agent_node(
     tools = tools_factory(session)
 
     # ── 注入 agenda() 递归工具 ──────────────────────────────────
-    @tools.register("agenda")
+    @tools.register("agenda")  # type: ignore[arg-type]
     async def agenda_tool(
         dag_yaml: str,
         workspace: str | None = None,

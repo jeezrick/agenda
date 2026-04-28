@@ -5,18 +5,16 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
-from agenda.cli import cli, _resolve_dag_path, _validate_dag, _load_scheduler
+from agenda.cli import _load_scheduler, _validate_dag, cli
 from agenda.const import (
-    EXIT_SUCCESS,
     EXIT_ARGS_ERROR,
     EXIT_DAG_CONFIG_ERROR,
     EXIT_EXECUTION_ERROR,
+    EXIT_SUCCESS,
 )
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -360,7 +358,6 @@ class TestGuide:
 class TestRunQuick:
     def test_run_quick_dry_build(self, monkeypatch, capsys, tmp_path: Path) -> None:
         """Test that run builds a single-node DAG and workspace correctly."""
-        import asyncio
         from unittest.mock import AsyncMock
 
         mock_agenda = AsyncMock(return_value={"task": "COMPLETED"})
@@ -391,7 +388,6 @@ class TestRunQuick:
 
     def test_run_quick_ephemeral(self, monkeypatch, capsys, tmp_path: Path) -> None:
         """Test ephemeral mode deletes workspace after run."""
-        import asyncio
         from unittest.mock import AsyncMock
 
         mock_agenda = AsyncMock(return_value={"task": "COMPLETED"})
@@ -414,7 +410,6 @@ class TestRunQuick:
 
     def test_run_quick_failed(self, monkeypatch, capsys, tmp_path: Path) -> None:
         """Test failed run returns correct exit code."""
-        import asyncio
         from unittest.mock import AsyncMock
 
         mock_agenda = AsyncMock(return_value={"task": "FAILED"})
@@ -434,7 +429,6 @@ class TestRunQuick:
 
     def test_run_quick_with_input_file(self, monkeypatch, capsys, tmp_path: Path) -> None:
         """Test input file is copied to node input/."""
-        import asyncio
         from unittest.mock import AsyncMock
 
         mock_agenda = AsyncMock(return_value={"task": "COMPLETED"})
@@ -471,7 +465,6 @@ class TestRunQuick:
 
     def test_run_quick_output_preview(self, monkeypatch, capsys, tmp_path: Path) -> None:
         """Test output preview is included in result."""
-        import asyncio
         from unittest.mock import AsyncMock
 
         mock_agenda = AsyncMock(return_value={"task": "COMPLETED"})
@@ -482,7 +475,7 @@ class TestRunQuick:
             "agenda", "run", "write something",
             "--output-dir", str(out_dir),
         ])
-        code = cli()
+        cli()
 
         # Manually write output to simulate agent completion
         output_file = out_dir / "nodes" / "task" / "output" / "draft.md"

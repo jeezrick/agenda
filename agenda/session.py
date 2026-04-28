@@ -18,9 +18,8 @@ from __future__ import annotations
         children/     ← 子 Agent 的 session
 """
 
+import contextlib
 import json
-import os
-import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -178,15 +177,13 @@ class Session:
         turns: list[dict] = []
         if not self._turns_path.exists():
             return turns
-        with open(self._turns_path, "r", encoding="utf-8") as f:
+        with open(self._turns_path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
-                try:
+                with contextlib.suppress(json.JSONDecodeError):
                     turns.append(json.loads(line))
-                except json.JSONDecodeError:
-                    pass
         return turns
 
     def replay_history(self) -> list[dict]:
@@ -244,7 +241,7 @@ class Session:
         if not self._events_path.exists():
             return [], 0
         events: list[dict] = []
-        with open(self._events_path, "r", encoding="utf-8") as f:
+        with open(self._events_path, encoding="utf-8") as f:
             f.seek(offset)
             data = f.read()
             new_offset = f.tell()
@@ -252,10 +249,8 @@ class Session:
             line = line.strip()
             if not line:
                 continue
-            try:
+            with contextlib.suppress(json.JSONDecodeError):
                 events.append(json.loads(line))
-            except json.JSONDecodeError:
-                pass
         return events, new_offset
 
     def events_size(self) -> int:
@@ -320,6 +315,6 @@ class Session:
 
     # --- 子 Agent 管理 ---
 
-    def child_session(self, name: str) -> "Session":
+    def child_session(self, name: str) -> Session:
         child_dir = self.children_dir / name
         return Session(child_dir)

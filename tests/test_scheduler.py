@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
-
 from unittest.mock import patch
-
-import pytest
 
 from agenda.scheduler import DAGScheduler
 from agenda.session import Session
@@ -127,10 +125,8 @@ class TestBaseCaseOptimization:
         assert not state_file.exists()
 
         # Run will fail (no LLM), but Base Case path should be taken
-        try:
+        with contextlib.suppress(Exception):
             asyncio.run(_run())
-        except Exception:
-            pass
 
         # State file should still not exist because Base Case skips scheduler
         assert not state_file.exists()

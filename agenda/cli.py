@@ -12,19 +12,19 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from .const import (
-    EXIT_SUCCESS,
     EXIT_ARGS_ERROR,
     EXIT_DAG_CONFIG_ERROR,
-    EXIT_EXECUTION_ERROR,
     EXIT_DEPENDENCY_ERROR,
+    EXIT_EXECUTION_ERROR,
+    EXIT_SUCCESS,
 )
-from .models import ModelConfig, ModelRegistry
-from .session import Session
+from .models import ModelRegistry
 from .scheduler import DAGScheduler
+from .session import Session
 from .tools import build_tools
-
 
 # ---------------------------------------------------------------------------
 # Agent 自举指南（嵌入 CLI，任何 Agent 都能通过 agenda guide --for-agent 获取）
@@ -330,7 +330,7 @@ def _json_out(data: dict) -> None:
     print(json.dumps(data, ensure_ascii=False))
 
 
-def _error_out(msg: str, code: int, **extra) -> int:
+def _error_out(msg: str, code: int, **extra: Any) -> int:
     out: dict = {"error": msg}
     out.update(extra)
     _json_out(out)
@@ -351,7 +351,7 @@ def _resolve_dag_path(dag_arg: str | None) -> Path:
     if not dag_path:
         _json_out({"error": "未指定 DAG 路径。提供路径或设置 AGENDA_DAG"})
         sys.exit(EXIT_ARGS_ERROR)
-    p = Path(dag_arg).expanduser().resolve()
+    p = Path(dag_arg).expanduser().resolve()  # type: ignore[arg-type]
     return p
 
 
@@ -844,7 +844,7 @@ def cli() -> int:
     # ------------------------------------------------------------------
     if args.cmd == "guide":
         if args.json:
-            sections = {}
+            sections: dict[str, list[str]] = {}
             current = None
             for line in AGENT_GUIDE.splitlines():
                 if line.startswith("## "):
@@ -1052,13 +1052,10 @@ def cli() -> int:
             daemon_parser.print_help()
             return EXIT_SUCCESS
 
-        from .daemon import _start_foreground, _start_daemon, _cmd_stop, _cmd_status
+        from .daemon import _cmd_status, _cmd_stop, _start_daemon, _start_foreground
 
         dag_path = _resolve_dag_path(args.path) if hasattr(args, "path") and args.path else Path(os.environ.get("AGENDA_DAG", "."))
-        if dag_path.is_file():
-            dag_dir = dag_path.parent
-        else:
-            dag_dir = dag_path
+        dag_dir = dag_path.parent if dag_path.is_file() else dag_path
 
         if args.daemon_cmd == "start":
             if args.foreground:
@@ -1087,9 +1084,9 @@ def cli() -> int:
             registry.load()
 
         if args.models_cmd == "list":
-            result = []
+            models_result: list[dict] = []
             for name, cfg in registry._models.items():
-                result.append({
+                models_result.append({
                     "name": name,
                     "model": cfg.model,
                     "base_url": cfg.base_url,
@@ -1097,11 +1094,11 @@ def cli() -> int:
                     "temperature": cfg.temperature,
                     "max_tokens": cfg.max_tokens,
                 })
-            _json_out({"models": result})
+            _json_out({"models": models_result})
             return EXIT_SUCCESS
 
         if args.models_cmd == "validate":
-            result = []
+            validate_result: list[dict] = []
             for name, cfg in registry._models.items():
                 item = {
                     "name": name,
@@ -1110,8 +1107,8 @@ def cli() -> int:
                     "base_url": cfg.base_url,
                     "has_api_key": bool(cfg.api_key),
                 }
-                result.append(item)
-            _json_out({"models": result})
+                validate_result.append(item)
+            _json_out({"models": validate_result})
             return EXIT_SUCCESS
 
     _json_out({"error": f"未知命令: {args.cmd}"})

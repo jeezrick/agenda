@@ -3,10 +3,7 @@
 import json
 from pathlib import Path
 
-import pytest
-
 from agenda.session import Session
-
 
 # ---------------------------------------------------------------------------
 # Construction

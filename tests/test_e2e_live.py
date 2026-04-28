@@ -13,13 +13,11 @@ from __future__ import annotations
 
 import asyncio
 import os
-import shutil
 from pathlib import Path
 
 import pytest
 
 from agenda import agenda
-
 
 pytestmark = pytest.mark.skipif(
     not os.environ.get("RUN_LIVE_TESTS"),

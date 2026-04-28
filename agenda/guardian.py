@@ -48,10 +48,10 @@ class Guardian:
         try:
             target.relative_to(self.root)
             return target
-        except ValueError:
+        except ValueError as _guardian_err:
             raise PermissionError(
                 f"[Guardian] {operation} to {target} denied; allowed root is {self.root}"
-            )
+            ) from _guardian_err
 
     def check_write(self, path: Path | str) -> Path:
         """检查写路径是否允许。"""

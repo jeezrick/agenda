@@ -1,6 +1,7 @@
 """Entry point for `python -m agenda`."""
 
 import sys
+
 from .cli import cli
 
 if __name__ == "__main__":

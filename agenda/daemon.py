@@ -10,8 +10,8 @@ from __future__ import annotations
 """
 
 import asyncio
+import contextlib
 import fcntl
-import json
 import os
 import signal
 import subprocess
@@ -20,12 +20,8 @@ import time
 from pathlib import Path
 from typing import IO
 
-from .const import EXIT_SUCCESS
 from .scheduler import DAGScheduler
-from .session import Session
-from .models import ModelRegistry
 from .tools import build_tools
-
 
 # ── PID / Lock 文件 ─────────────────────────────────────────────────────────
 
@@ -54,7 +50,7 @@ def _acquire_lock(dag_dir: Path) -> bool:
         return True
     path = _lock_file(dag_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = open(path, "a")
+    fd = open(path, "a")  # noqa: SIM115
     try:
         fcntl.flock(fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except (BlockingIOError, OSError):
@@ -68,14 +64,10 @@ def _release_lock() -> None:
     global _lock_fd
     if _lock_fd is None:
         return
-    try:
+    with contextlib.suppress(OSError):
         fcntl.flock(_lock_fd.fileno(), fcntl.LOCK_UN)
-    except OSError:
-        pass
-    try:
+    with contextlib.suppress(OSError):
         _lock_fd.close()
-    except OSError:
-        pass
     _lock_fd = None
 
 
@@ -96,10 +88,8 @@ def _read_pid(dag_dir: Path) -> int | None:
 
 
 def _clear_pid(dag_dir: Path) -> None:
-    try:
+    with contextlib.suppress(OSError):
         _pid_file(dag_dir).unlink(missing_ok=True)
-    except OSError:
-        pass
 
 
 def _is_running(dag_dir: Path) -> int | None:
@@ -301,16 +291,15 @@ def _start_daemon(dag_dir: Path, dag_file: Path) -> int:
     ]
     lf = _log_file(dag_dir)
     lf.parent.mkdir(parents=True, exist_ok=True)
-    log_fh = open(lf, "a")
-    proc = subprocess.Popen(
-        cmd,
-        stdout=log_fh,
-        stderr=log_fh,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-        cwd=str(Path.cwd()),
-    )
-    log_fh.close()
+    with open(lf, "a") as log_fh:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_fh,
+            stderr=log_fh,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            cwd=str(Path.cwd()),
+        )
 
     time.sleep(0.5)
     if proc.poll() is not None:
@@ -341,11 +330,9 @@ def _cmd_stop(dag_dir: Path) -> int:
             _clear_pid(dag_dir)
             print("Daemon stopped.")
             return 0
-    print(f"Warning: daemon did not stop within 2s. Sending SIGKILL...")
-    try:
+    print("Warning: daemon did not stop within 2s. Sending SIGKILL...")
+    with contextlib.suppress(ProcessLookupError):
         os.kill(pid, signal.SIGKILL)
-    except ProcessLookupError:
-        pass
     _clear_pid(dag_dir)
     print("Daemon killed.")
     return 0

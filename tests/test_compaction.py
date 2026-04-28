@@ -4,15 +4,12 @@ from __future__ import annotations
 
 import asyncio
 
-import pytest
-
 from agenda.compaction import (
     CompactionResult,
     SimpleCompaction,
     estimate_text_tokens,
     should_auto_compact,
 )
-
 
 # ---------------------------------------------------------------------------
 # should_auto_compact

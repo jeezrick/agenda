@@ -5,15 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Any
 
-import pytest
-
-from agenda.scheduler import DAGScheduler
 from agenda.agent import AgentLoop
+from agenda.scheduler import DAGScheduler
 from agenda.session import Session
 from agenda.tools import build_tools
-
 
 # ── Mock helpers ───────────────────────────────────────────────────────────
 

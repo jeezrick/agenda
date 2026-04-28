@@ -13,9 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import random
-import re
 import time
 import traceback
 from datetime import datetime
@@ -29,8 +27,8 @@ from .const import (
     DEFAULT_MAX_ITERATIONS,
     DEFAULT_NODE_TIMEOUT,
 )
-from .session import Session
 from .models import ModelRegistry
+from .session import Session
 from .tools import ToolRegistry
 
 
@@ -164,7 +162,7 @@ class AgentLoop:
                         "iteration": iteration,
                         "ts": datetime.now().isoformat(),
                     })
-                    result = msg_dict.get("content", "")
+                    result: str = msg_dict.get("content", "")
                     return result
 
                 # 执行 tools
@@ -264,9 +262,7 @@ class AgentLoop:
         )):
             return True
         # OSError 包含连接错误
-        if isinstance(exc, OSError):
-            return True
-        return False
+        return bool(isinstance(exc, OSError))
 
     async def _call_llm_with_cfg(self, cfg: Any) -> dict:
         """用指定配置调用 LLM。"""
@@ -293,7 +289,7 @@ class AgentLoop:
             standard_kwargs["extra_body"] = extra_body
 
         resp = await client.chat.completions.create(**standard_kwargs)
-        return resp.model_dump()
+        return resp.model_dump()  # type: ignore[no-any-return]
 
     async def _execute_tool(self, tc: dict) -> str:
         """执行单个 tool call。"""
@@ -308,7 +304,7 @@ class AgentLoop:
 
         try:
             if asyncio.iscoroutinefunction(tool):
-                return await tool(**args)
+                return await tool(**args)  # type: ignore[no-any-return]
             else:
                 return tool(**args)
         except Exception as e:

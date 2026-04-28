@@ -274,16 +274,55 @@ function buildEffectiveSystemPrompt(
 - **General-purpose**: 使用默认 prompt
 - **Fork**: 克隆 parent 的完整 system prompt（共享 cache）
 
-### 1.5 Prompt 组装对比总结
+### 1.5 Codex
 
-| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** |
-|-----|-----------|-----------|----------|-----------------|
-| **模板引擎** | 字符串拼接 | 字符串拼接 | Jinja2 (`${VAR}`) | **多阶段流水线（拼接 + 注入）** |
-| **Static/Dynamic 分离** | `_build_system_parts()` | 无 | 无 | **`SYSTEM_PROMPT_DYNAMIC_BOUNDARY` 标记** |
-| **Subagent 差异** | mode.md + Agent Collaboration Mode | 固定日期 + 身份声明 | ROLE_ADDITIONAL | **AgentDefinition.getSystemPrompt() 整体替换** |
-| **Prompt 缓存** | Anthropic prompt caching | 无 | 无 | **forkedAgent 共享主线程 cache（全缓存复用）** |
-| **恢复时复用** | 重新加载文件 | 重新构建 | 复用持久化的 prompt | **上下文不变，仅切换 query 循环** |
-| **Context 注入时机** | 运行时拼接 | 构建时 | 模板渲染时 | **API 调用时 appendSystemContext + prependUserContext** |
+**Prompt 组装**（通过 Session + TurnContext 构建 Prompt）：
+
+```rust
+// codex-rs/core/src/session/turn.rs:build_prompt()
+pub(crate) fn build_prompt(input, router, turn_context, base_instructions) -> Prompt {
+    Prompt {
+        input,                        // 历史消息
+        tools,                        // 模型可见的工具列表
+        parallel_tool_calls,          // 是否支持并行工具调用
+        base_instructions,            // 基础系统指令
+        personality,                  // 个性化偏好（如 "concise", "friendly"）
+        output_schema,                // 结构化输出 JSON schema
+        output_schema_strict,         // 严格模式开关
+    }
+}
+```
+
+**Base Instructions 来源**（SessionConfiguration）：
+```
+base_instructions: String,       // 模型的核心指令（系统提示）
+developer_instructions: Option,   // 开发者补充指令
+user_instructions: Option,        // 用户自定义指令
+compact_prompt: Option,          // 压缩提示覆盖
+personality: Option<Personality>, // 人格偏好
+```
+
+**Subagent 的 Prompt 差异**：
+- **Subagent 使用相同的 Prompt 结构**，但 `base_instructions` 相同
+- 通过 `SessionSource::SubAgent` 区分主体/子体
+- 角色通过 `agent_type` 参数选择：`apply_role_to_config()` 加载角色的 YAML 配置来修改 prompt
+- `hierarchical_agents_message.md` 提供层次化代理的通用提示模板
+
+**关键设计**：
+- Prompt 是数据，不是字符串拼接 — `Prompt` struct 明确包含所有构建要素
+- 所有指令通过 `SessionConfiguration` 管理，非全局状态
+- 模型指令通过 `ModelProviderInfo::get_model_instructions(personality)` 动态获取
+
+### 1.6 Prompt 组装对比总结
+
+| 维度 | Butterfly | Claw Code | Kimi CLI | **Claude Code** | **Codex** |
+|-----|-----------|-----------|----------|-----------------|-----------|
+| **模板引擎** | 字符串拼接 | 字符串拼接 | Jinja2 (`${VAR}`) | **多阶段流水线（拼接 + 注入）** | **结构化 Prompt struct** |
+| **Static/Dynamic 分离** | `_build_system_parts()` | 无 | 无 | **`SYSTEM_PROMPT_DYNAMIC_BOUNDARY` 标记** | **SessionConfiguration 分层** |
+| **Subagent 差异** | mode.md + Agent Collaboration Mode | 固定日期 + 身份声明 | ROLE_ADDITIONAL | **AgentDefinition.getSystemPrompt() 整体替换** | **agent_type 角色配置 + hierarchical_agents 模板** |
+| **Prompt 缓存** | Anthropic prompt caching | 无 | 无 | **forkedAgent 共享主线程 cache（全缓存复用）** | 无 |
+| **恢复时复用** | 重新加载文件 | 重新构建 | 复用持久化的 prompt | **上下文不变，仅切换 query 循环** | **从 state DB + rollout 恢复** |
+| **Context 注入时机** | 运行时拼接 | 构建时 | 模板渲染时 | **API 调用时 appendSystemContext + prependUserContext** | **build_initial_context + record_context_updates** |
 
 ---
 
