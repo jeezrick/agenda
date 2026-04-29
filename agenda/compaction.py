@@ -269,3 +269,58 @@ class SimpleCompaction:
         ]
         compacted_messages.extend(to_preserve)
         return CompactionResult(messages=compacted_messages, usage=usage)
+
+    @staticmethod
+    def validate_compacted(
+        compacted: CompactionResult,
+        original_messages: list[dict],
+        token_cap: int,
+    ) -> bool:
+        """验证压缩产物是否有效。
+
+        Returns True when:
+        - 压缩后内容非空
+        - 压缩后的 token 数不超过原 token 数（压缩没有膨胀上下文）
+        - 压缩后的 token 数不超过 token_cap
+        """
+        if not compacted.messages:
+            return False
+        compact_text = compacted.messages[0].get("content", "")
+        if not compact_text or len(compact_text) < 50:
+            return False
+        post_tokens = estimate_text_tokens(compacted.messages)
+        pre_tokens = estimate_text_tokens(original_messages)
+        if post_tokens > pre_tokens:
+            return False
+        return not (post_tokens > token_cap)
+
+    @staticmethod
+    def truncate_messages(
+        messages: list[dict],
+        max_tokens: int,
+        *,
+        max_iterations: int = 100,
+    ) -> list[dict]:
+        """截断策略：从头部删除消息直到 token 数达标。
+
+        保证不拆分 tool_use/tool_result 对，同时保留 system 消息。
+        只在压缩 LLM 多次失败时作为最后手段。
+        """
+        if not messages:
+            return list(messages)
+
+        current = list(messages)
+        for _ in range(max_iterations):
+            tok = estimate_text_tokens(current)
+            if tok <= max_tokens:
+                return current
+            if len(current) <= 1:
+                return current
+            # 跳过 system 消息
+            drop_idx = 1 if current[0].get("role") == "system" and len(current) > 2 else 0
+            if drop_idx >= len(current):
+                return current
+            # 检查 tool pair 完整性
+            boundary = SimpleCompaction._ensure_tool_pair_integrity(current, drop_idx + 1)
+            current = current[boundary:] if boundary > 0 else current[1:]
+        return current

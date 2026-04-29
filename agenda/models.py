@@ -27,8 +27,10 @@ class ModelConfig:
     provider: str = "openai"  # 预留：未来支持非 OpenAI 接口
     fallback_model: str | None = None  # 备用模型名（主模型失败时切换）
     fallback_provider: str | None = None  # 备用 provider
+    compact_model: str | None = None  # 专用压缩模型别名（未设置则用主模型压缩）
     temperature: float = 1.0  # 采样温度（DeepSeek 建议 Agent 用 1.0）
     max_tokens: int | None = None  # 最大输出 token 数
+    stream: bool = True  # 是否启用流式输出
     extra_params: dict | None = None  # provider-specific 参数（如 thinking、reasoning_effort）
 
 
@@ -81,8 +83,10 @@ class ModelRegistry:
                 "provider",
                 "fallback_model",
                 "fallback_provider",
+                "compact_model",
                 "temperature",
                 "max_tokens",
+                "stream",
             }
             extra = {k: v for k, v in cfg.items() if k not in standard_fields}
             self._models[name] = ModelConfig(
@@ -94,8 +98,10 @@ class ModelRegistry:
                 provider=cfg.get("provider", "openai"),
                 fallback_model=cfg.get("fallback_model"),
                 fallback_provider=cfg.get("fallback_provider"),
+                compact_model=cfg.get("compact_model"),
                 temperature=float(cfg.get("temperature", 1.0)),
                 max_tokens=cfg.get("max_tokens"),
+                stream=bool(cfg.get("stream", True)),
                 extra_params=extra if extra else None,
             )
 

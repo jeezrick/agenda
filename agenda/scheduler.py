@@ -53,6 +53,7 @@ class DAGScheduler:
         self.failed: set[str] = set()
         self.retries: dict[str, int] = {}  # 节点 -> 已重试次数
         self._cancelled = False
+        self.hooks = None  # HookRegistry, 由外部注入
 
         # 加载模型注册表
         self.model_registry = ModelRegistry().load(self.dag_dir)
@@ -239,9 +240,28 @@ class DAGScheduler:
                 dep_section += f'- read_file("input/{to_path}")\n'
 
         # 5. 写 hints
+        schema_section = ""
+        output_schema = config.get("output_schema")
+        if output_schema:
+            try:
+                schema_json = json.dumps(output_schema, ensure_ascii=False, indent=2)
+                schema_section = f"""
+## 输出格式要求
+
+你的最终产物必须是符合以下 JSON Schema 的有效 JSON，写入 output/draft.md：
+
+```json
+{schema_json}
+```
+
+请确保输出是一个纯 JSON 对象，不要用 markdown 代码块包裹，不要加任何前缀或后缀文字。
+"""
+            except (TypeError, ValueError):
+                pass
+
         hints = f"""# DAG 任务: {node_id}
 ## 提示
-{config.get("prompt", "")}{files_section}{dep_section}
+{config.get("prompt", "")}{files_section}{dep_section}{schema_section}
 ## 规则
 - 用 read_file / write_file 工具操作文件
 - 按需读取 input/ 下的内容，不要一次性加载所有
@@ -439,6 +459,9 @@ class DAGScheduler:
         model_alias = config.get("model")
         print(f"[节点] {node_id} 启动 (模型: {model_alias or 'default'})")
 
+        if self.hooks:
+            await self.hooks.emit("on_node_start", node_id=node_id, config=config)
+
         try:
             session = self.prepare_node(node_id, depth=depth)
 
@@ -448,11 +471,14 @@ class DAGScheduler:
                 model_registry=self.model_registry,
                 tools_factory=tools_factory,
                 depth=depth,
+                hooks=self.hooks,
             )
 
             session.set_state("status", "completed")
             session.set_state("completed_at", datetime.now().isoformat())
             print(f"[节点] {node_id} 完成")
+            if self.hooks:
+                await self.hooks.emit("on_node_complete", node_id=node_id, config=config)
 
         except asyncio.CancelledError:
             session = Session(self.nodes_dir / node_id)
@@ -464,6 +490,8 @@ class DAGScheduler:
             session = Session(self.nodes_dir / node_id)
             session.write_system("error.log", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
             session.set_state("status", "failed")
+            if self.hooks:
+                await self.hooks.emit("on_node_error", node_id=node_id, error=e)
 
         finally:
             self.running.discard(node_id)

@@ -258,6 +258,22 @@ class Session:
     def send_message(self, content: str, source: str) -> None:
         self.append_event({"type": "message", "from": source, "content": content})
 
+    # --- 审批 ---
+
+    def request_approval(self, tool_name: str, args_json: str) -> None:
+        """写入审批请求事件。"""
+        self.append_event(
+            {
+                "type": "pending_review",
+                "tool": tool_name,
+                "args": args_json,
+            }
+        )
+
+    def respond_approval(self, decision: str) -> None:
+        """写入审批响应（由 CLI 调用）。decision 为 'approved' 或 'rejected'。"""
+        self.append_event({"type": "approval", "decision": decision})
+
     # --- 内部工具 ---
 
     def _resolve_safe(self, rel_path: str) -> Path | None:

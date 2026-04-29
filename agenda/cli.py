@@ -686,6 +686,14 @@ def cli() -> int:
     node_logs.add_argument("path", nargs="?")
     node_logs.add_argument("--node", required=True)
 
+    node_approve = node_sub.add_parser("approve", help="批准节点审批请求")
+    node_approve.add_argument("path", nargs="?")
+    node_approve.add_argument("--node", required=True)
+
+    node_reject = node_sub.add_parser("reject", help="拒绝节点审批请求")
+    node_reject.add_argument("path", nargs="?")
+    node_reject.add_argument("--node", required=True)
+
     # ------------------------------------------------------------------
     # daemon
     # ------------------------------------------------------------------
@@ -1049,6 +1057,32 @@ def cli() -> int:
                         "output_exists": session.output_exists,
                     }
                 )
+                return EXIT_SUCCESS
+            except FileNotFoundError as e:
+                return _error_out(str(e), EXIT_ARGS_ERROR)
+            except Exception as e:
+                return _error_out(str(e), EXIT_EXECUTION_ERROR, traceback=traceback.format_exc())
+
+        if args.node_cmd == "approve":
+            try:
+                dag_path = _resolve_dag_path(args.path)
+                scheduler = _load_scheduler(dag_path)
+                session = Session(scheduler.nodes_dir / args.node)
+                session.respond_approval("approved")
+                _json_out({"node": args.node, "approved": True})
+                return EXIT_SUCCESS
+            except FileNotFoundError as e:
+                return _error_out(str(e), EXIT_ARGS_ERROR)
+            except Exception as e:
+                return _error_out(str(e), EXIT_EXECUTION_ERROR, traceback=traceback.format_exc())
+
+        if args.node_cmd == "reject":
+            try:
+                dag_path = _resolve_dag_path(args.path)
+                scheduler = _load_scheduler(dag_path)
+                session = Session(scheduler.nodes_dir / args.node)
+                session.respond_approval("rejected")
+                _json_out({"node": args.node, "rejected": True})
                 return EXIT_SUCCESS
             except FileNotFoundError as e:
                 return _error_out(str(e), EXIT_ARGS_ERROR)

@@ -31,6 +31,7 @@ from .const import (
 )
 from .daemon import NodeWatcher
 from .guardian import Guardian
+from .hook import HookRegistry
 from .models import ModelConfig, ModelRegistry
 from .scheduler import DAGScheduler
 from .session import Session
@@ -44,6 +45,7 @@ async def agenda(
     *,
     model_registry: ModelRegistry | None = None,
     tools_factory: Any = None,
+    hooks: HookRegistry | None = None,
 ) -> dict[str, str]:
     """统一入口：执行 DAG，自动退化 Base Case。
 
@@ -87,6 +89,7 @@ async def agenda(
         model_registry=model_registry,
         tools_factory=tools_factory,
         depth=0,
+        hooks=hooks,
     )
 
 
@@ -105,6 +108,7 @@ __all__ = [
     "AgentLoop",
     "DAGScheduler",
     "NodeWatcher",
+    "HookRegistry",
     "agenda",
     "cli",
 ]

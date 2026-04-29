@@ -12,13 +12,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import fcntl
+import json
 import os
 import signal
 import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import IO
+from typing import IO, Any
 
 from .scheduler import DAGScheduler
 from .tools import build_tools
@@ -112,14 +113,19 @@ class NodeWatcher:
     """扫描 DAG 节点目录，管理正在运行的节点 task。
 
     类似于 Butterfly 的 SessionWatcher，但管理的是 DAG 节点而非 session。
+
+    支持 DAG 文件监听（可选 watchdog 依赖）。
     """
 
-    def __init__(self, dag_dir: Path, dag_file: Path) -> None:
+    def __init__(self, dag_dir: Path, dag_file: Path, metrics: Any = None) -> None:
         self.dag_dir = dag_dir
         self.dag_file = dag_file
+        self.metrics = metrics
         self._active: dict[str, asyncio.Task] = {}  # node_id → task
         self._finished: set[str] = set()
         self._scheduler: DAGScheduler | None = None
+        self._dag_mtime: float = 0.0
+        self._watcher: Any = None
 
     async def run(self, stop_event: asyncio.Event) -> None:
         """主循环，直到 stop_event 被设置。"""
@@ -129,6 +135,10 @@ class NodeWatcher:
         self._scheduler = DAGScheduler(self.dag_dir.parent, self.dag_dir.name)
         self._scheduler.dag_file = self.dag_file
         self._scheduler.load()
+        self._dag_mtime = self.dag_file.stat().st_mtime if self.dag_file.exists() else 0
+
+        # 启动 DAG 文件监听
+        self._start_file_watcher()
 
         # 初始扫描：恢复已存在的节点
         discovered = await self._scan()
@@ -137,9 +147,15 @@ class NodeWatcher:
 
         while not stop_event.is_set():
             await asyncio.sleep(1.0)
+
+            # DAG 文件变更检测
+            self._check_dag_reload()
+
             new = await self._scan()
             for node_id in new:
                 print(f"[daemon] Discovered: {node_id}")
+
+        self._stop_file_watcher()
 
         # 优雅关闭：取消所有活动 task
         tasks = list(self._active.values())
@@ -148,6 +164,64 @@ class NodeWatcher:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
         print("[daemon] All node tasks stopped.")
+
+    def _start_file_watcher(self) -> None:
+        """尝试启动 watchdog 文件监听（可选依赖）。"""
+        try:
+            from watchdog.events import FileSystemEventHandler
+            from watchdog.observers import Observer
+
+            dag_file = self.dag_file
+
+            class _Handler(FileSystemEventHandler):
+                def on_modified(self, event: Any) -> None:
+                    if event.src_path and Path(event.src_path).resolve() == dag_file.resolve():
+                        self._modified = True
+
+                def __init__(self) -> None:
+                    super().__init__()
+                    self._modified = False
+
+            handler = _Handler()
+            observer = Observer()
+            observer.schedule(handler, str(self.dag_file.parent), recursive=False)
+            observer.start()
+            self._watcher = (observer, handler)
+            print("[daemon] watchdog 文件监听已启动")
+        except ImportError:
+            pass  # watchdog 未安装，回退到轮询
+
+    def _stop_file_watcher(self) -> None:
+        if self._watcher:
+            observer, _handler = self._watcher
+            observer.stop()
+            observer.join(timeout=2)
+            self._watcher = None
+
+    def _check_dag_reload(self) -> None:
+        """检查 DAG 文件是否变更，如有则重载。"""
+        if self._watcher:
+            _observer, handler = self._watcher
+            if handler._modified:
+                handler._modified = False
+                self._reload_dag()
+        else:
+            # 回退到 mtime 轮询
+            try:
+                mtime = self.dag_file.stat().st_mtime
+                if mtime > self._dag_mtime + 0.3:  # 300ms debounce
+                    self._dag_mtime = mtime
+                    self._reload_dag()
+            except OSError:
+                pass
+
+    def _reload_dag(self) -> None:
+        """重载 DAG 配置。"""
+        print("[daemon] DAG 文件已变更，重新加载...")
+        if self._scheduler:
+            self._scheduler.load()
+            print(f"[daemon] 重载完成: {len(self._scheduler.dag.get('nodes', {}))} 个节点")
+
 
     async def _scan(self) -> list[str]:
         """扫描节点目录，启动需要运行的节点。"""
@@ -221,6 +295,55 @@ class NodeWatcher:
             raise
         except Exception as exc:
             print(f"[daemon] Node {node_id} crashed: {exc}")
+
+
+# ── Webhook ─────────────────────────────────────────────────────────────────
+
+
+class WebhookHook:
+    """Webhook 通知钩子（基于 HookRegistry）。
+
+    DAG YAML 配置示例:
+        webhooks:
+          on_node_complete: "https://hooks.example.com/agenda/complete"
+          on_node_error: "https://hooks.example.com/agenda/error"
+    """
+
+    def __init__(self, webhooks_config: dict | None = None) -> None:
+        self._urls = webhooks_config or {}
+
+    def register_all(self, hooks: Any) -> None:
+        if not self._urls:
+            return
+        hooks.register("on_node_complete", self._on_node_complete)
+        hooks.register("on_node_error", self._on_node_error)
+
+    def _post(self, url: str, data: dict) -> None:
+        try:
+            import urllib.request
+
+            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+            req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
+            urllib.request.urlopen(req, timeout=10)
+        except Exception as e:
+            print(f"[webhook] POST {url} 失败: {e}")
+
+    def _on_node_complete(self, **kwargs: Any) -> None:
+        url = self._urls.get("on_node_complete")
+        if url:
+            self._post(url, {"event": "node_complete", "node_id": kwargs.get("node_id", "?")})
+
+    def _on_node_error(self, **kwargs: Any) -> None:
+        url = self._urls.get("on_node_error")
+        if url:
+            self._post(
+                url,
+                {
+                    "event": "node_error",
+                    "node_id": kwargs.get("node_id", "?"),
+                    "error": str(kwargs.get("error", "")),
+                },
+            )
 
 
 # ── Server core ─────────────────────────────────────────────────────────────

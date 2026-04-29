@@ -26,6 +26,7 @@ from .const import (
     DEFAULT_COMPACTION_TRIGGER_RATIO,
     DEFAULT_MAX_ITERATIONS,
     DEFAULT_NODE_TIMEOUT,
+    MAX_PARALLEL_TOOLS,
 )
 from .models import ModelRegistry
 from .session import Session
@@ -57,6 +58,8 @@ class AgentLoop:
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         timeout: float = DEFAULT_NODE_TIMEOUT,
         node_id: str | None = None,
+        stream: bool = True,
+        hooks: Any = None,
     ) -> None:
         self.session = session
         self.model_registry = model_registry
@@ -67,6 +70,14 @@ class AgentLoop:
         self.max_iterations = max(1, max_iterations)
         self.timeout = timeout
         self.node_id = node_id
+        self.stream = stream and self.model_cfg.stream
+        self.hooks = hooks
+        self.approval_required: bool = False
+        self.approval_tools: list[str] = []
+        self.approval_timeout: float = 300.0
+        self._compact_model_cfg = (
+            model_registry.get(self.model_cfg.compact_model) if self.model_cfg.compact_model else None
+        )
         self._clients: dict[tuple, Any] = {}
         self._cancelled = False
         self._events_offset: int = 0
@@ -128,6 +139,8 @@ class AgentLoop:
                         raise
 
                 # 调用 LLM
+                if self.hooks:
+                    await self.hooks.emit("on_turn_start", iteration=iteration, node_id=self.node_id, token_count=estimate_text_tokens(self.messages))
                 response = await self._call_llm()
                 choice = response["choices"][0]
                 finish_reason = choice.get("finish_reason")
@@ -169,16 +182,37 @@ class AgentLoop:
                     result: str = msg_dict.get("content", "")
                     return result
 
-                # 执行 tools
+                # 执行 tools（并行：asyncio.gather）
                 pending_tool_calls: list[dict] = msg_dict.get("tool_calls", [])
-                for tc in pending_tool_calls:
-                    result = await self._execute_tool(tc)
-                    tool_result = {
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "content": str(result)[:4000],
-                    }
-                    self.messages.append(tool_result)
+                batches = [
+                    pending_tool_calls[i : i + MAX_PARALLEL_TOOLS]
+                    for i in range(0, len(pending_tool_calls), MAX_PARALLEL_TOOLS)
+                ]
+                for batch in batches:
+                    if self.hooks:
+                        for tc in batch:
+                            await self.hooks.emit(
+                                "on_tool_call",
+                                node_id=self.node_id,
+                                tool=tc["function"]["name"],
+                                args=tc["function"].get("arguments", "{}"),
+                            )
+                    results = await asyncio.gather(
+                        *[self._execute_tool(tc) for tc in batch],
+                        return_exceptions=True,
+                    )
+                    for tc, raw_result in zip(batch, results, strict=False):
+                        result_text = (
+                            f"[执行错误] {type(raw_result).__name__}: {raw_result}"
+                            if isinstance(raw_result, Exception)
+                            else str(raw_result)
+                        )
+                        tool_result = {
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "content": result_text[:4000],
+                        }
+                        self.messages.append(tool_result)
 
                 # 发送 progress 事件到 IPC（让外部观察者知道进度）
                 self.session.append_event(
@@ -244,12 +278,11 @@ class AgentLoop:
         return self._clients[key]
 
     async def _call_llm(self) -> dict:
-        """调用 LLM API。支持 fallback 模型。"""
+        """调用 LLM API。支持 fallback 模型和流式输出。"""
         cfg = self.model_cfg
         try:
-            return await self._call_llm_with_cfg(cfg)
+            return await self._call_llm_with_cfg(cfg, stream=self.stream)
         except Exception as primary_exc:
-            # 只有网络/服务端错误才 fallback，代码错误直接抛
             if not self._is_fallbackable_error(primary_exc):
                 raise
             fb_model = cfg.fallback_model
@@ -257,7 +290,7 @@ class AgentLoop:
                 raise
             print(f"  [Fallback] 主模型失败 ({type(primary_exc).__name__})，切换备用模型: {fb_model}")
             fb_cfg = self.model_registry.get(fb_model)
-            return await self._call_llm_with_cfg(fb_cfg)
+            return await self._call_llm_with_cfg(fb_cfg, stream=self.stream)
 
     def _is_fallbackable_error(self, exc: Exception) -> bool:
         """判断错误是否可 fallback（网络/服务端错误）。"""
@@ -273,12 +306,81 @@ class AgentLoop:
             ),
         ):
             return True
-        # OSError 包含连接错误
         return bool(isinstance(exc, OSError))
 
-    async def _call_llm_with_cfg(self, cfg: Any) -> dict:
-        """用指定配置调用 LLM。"""
+    async def _call_llm_with_cfg(self, cfg: Any, *, stream: bool = False) -> dict:
+        """用指定配置调用 LLM。stream=True 时走流式路径。"""
+        if stream:
+            return await self._call_llm_stream(cfg)
+        return await self._call_llm_batch(cfg)
+
+    async def _call_llm_batch(self, cfg: Any) -> dict:
+        """非流式调用 LLM（原 _call_llm_with_cfg 逻辑）。"""
         client = self._get_client(cfg)
+        kwargs = self._build_llm_kwargs(cfg)
+        resp = await client.chat.completions.create(**kwargs)
+        return resp.model_dump()  # type: ignore[no-any-return]
+
+    async def _call_llm_stream(self, cfg: Any) -> dict:
+        """流式调用 LLM，逐 chunk 输出到 stdout，返回完整响应 dict。"""
+        client = self._get_client(cfg)
+        kwargs = self._build_llm_kwargs(cfg)
+        kwargs["stream"] = True
+        kwargs["stream_options"] = {"include_usage": True}
+
+        content_parts: list[str] = []
+        tool_call_deltas: dict[int, dict[str, Any]] = {}  # index -> accumulated
+        usage: dict | None = None
+
+        prefix = f"[{self.node_id}] " if self.node_id else ""
+        stream = client.chat.completions.create(**kwargs)
+        async for chunk in stream:
+            if not chunk.choices:
+                # 最后一个 chunk（只含 usage，无 choices）
+                if hasattr(chunk, "usage") and chunk.usage:
+                    usage = chunk.usage.model_dump()
+                continue
+
+            delta = chunk.choices[0].delta
+            if delta.content:
+                content_parts.append(delta.content)
+                print(f"{prefix}{delta.content}", end="", flush=True)
+
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    idx = tc_delta.index
+                    if idx not in tool_call_deltas:
+                        tool_call_deltas[idx] = {
+                            "id": tc_delta.id or "",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        }
+                    acc = tool_call_deltas[idx]
+                    if tc_delta.id:
+                        acc["id"] = tc_delta.id
+                    if tc_delta.function:
+                        if tc_delta.function.name:
+                            acc["function"]["name"] += tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            acc["function"]["arguments"] += tc_delta.function.arguments
+
+        if content_parts:
+            print()  # 换行结束流式输出
+
+        content = "".join(content_parts)
+        tool_calls = [tool_call_deltas[i] for i in sorted(tool_call_deltas)] if tool_call_deltas else None
+
+        message: dict[str, Any] = {"role": "assistant", "content": content}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
+
+        return {
+            "choices": [{"message": message, "finish_reason": "stop"}],
+            "usage": usage,
+        }
+
+    def _build_llm_kwargs(self, cfg: Any) -> dict[str, Any]:
+        """构建 LLM API 调用参数（公共逻辑）。"""
         kwargs: dict[str, Any] = {
             "model": cfg.model,
             "messages": self.messages,
@@ -292,40 +394,54 @@ class AgentLoop:
             kwargs["tools"] = self.tools.schemas()
             kwargs["tool_choice"] = "auto"
 
-        # OpenAI SDK 不识别 provider-specific 参数（如 DeepSeek 的 thinking/reasoning_effort），
-        # 需要拆分到 extra_body 中透传。
         standard_keys = {
-            "model",
-            "messages",
-            "temperature",
-            "max_tokens",
-            "tools",
-            "tool_choice",
-            "stream",
-            "stop",
-            "top_p",
-            "frequency_penalty",
-            "presence_penalty",
-            "logprobs",
-            "top_logprobs",
-            "response_format",
-            "n",
-            "user",
+            "model", "messages", "temperature", "max_tokens", "tools", "tool_choice",
+            "stream", "stream_options", "stop", "top_p", "frequency_penalty",
+            "presence_penalty", "logprobs", "top_logprobs", "response_format", "n", "user",
         }
         extra_body = {k: v for k, v in kwargs.items() if k not in standard_keys}
         standard_kwargs = {k: v for k, v in kwargs.items() if k in standard_keys}
         if extra_body:
             standard_kwargs["extra_body"] = extra_body
+        return standard_kwargs
 
-        resp = await client.chat.completions.create(**standard_kwargs)
-        return resp.model_dump()  # type: ignore[no-any-return]
+    async def _request_approval(self, tool_name: str, args_json: str) -> bool:
+        """请求人工审批工具调用。轮询等待批准/拒绝/超时。"""
+        self.session.request_approval(tool_name, args_json)
+        print(f"  [审批] 等待人工批准: {tool_name}")
+
+        start = asyncio.get_event_loop().time()
+        checked = 0
+        while True:
+            events, new_offset = self.session.poll_events(checked)
+            for e in events[checked:]:
+                if e.get("type") == "approval":
+                    decision = str(e.get("decision", "rejected"))
+                    print(f"  [审批] {tool_name}: {decision}")
+                    self._events_offset = new_offset
+                    return decision == "approved"
+            checked = len(events) if events else checked
+            elapsed = asyncio.get_event_loop().time() - start
+            if elapsed > self.approval_timeout:
+                print(f"  [审批] {tool_name}: 超时")
+                return False
+            await asyncio.sleep(0.5)
 
     async def _execute_tool(self, tc: dict) -> str:
-        """执行单个 tool call。"""
+        """执行单个 tool call。支持人工审批门。"""
         func = tc["function"]
         name = func["name"]
         args = json.loads(func["arguments"]) if func["arguments"] else {}
-        print(f"  [Tool] {name}({json.dumps(args, ensure_ascii=False)[:200]})")
+        args_json = json.dumps(args, ensure_ascii=False)[:200]
+        print(f"  [Tool] {name}({args_json})")
+
+        # 审批检查：需要审批且未批准则拒绝
+        if self.approval_required:
+            approval_tools = self.approval_tools if self.approval_tools else [name]
+            if name in approval_tools:
+                approved = await self._request_approval(name, args_json)
+                if not approved:
+                    return f"[审批] 工具调用 {name} 被拒绝或超时"
 
         tool = self.tools.get(name)
         if not tool:
@@ -363,11 +479,17 @@ class AgentLoop:
     async def _compact_context(self, system_prompt: str) -> None:
         """系统驱动记忆压缩（学 Kimi Code CLI）。
 
-        带指数退避重试（最多 3 次），失败时向上抛出 RuntimeError。
+        改进：专用压缩模型 + 压缩后验证 + 截断回退。
         """
         max_retries = 3
         base_delay = 1.0
-        last_error = None
+
+        # 使用专用压缩模型（配置了 compact_model 时），否则回退到主模型
+        compact_cfg = self._compact_model_cfg or self.model_cfg
+        compact_client = self._get_client(compact_cfg)
+        compact_model = compact_cfg.model
+        if self._compact_model_cfg:
+            print(f"  [压缩] 使用专用压缩模型: {compact_model}")
 
         pre_token_count = estimate_text_tokens(self.messages)
 
@@ -376,9 +498,13 @@ class AgentLoop:
                 compactor = SimpleCompaction(max_preserved_messages=DEFAULT_COMPACTION_MAX_PRESERVED)
                 compacted = await compactor.compact(
                     self.messages,
-                    client=self._get_client(self.model_cfg),
-                    model=self.model_cfg.model,
+                    client=compact_client,
+                    model=compact_model,
                 )
+
+                # 压缩后验证
+                if not SimpleCompaction.validate_compacted(compacted, self.messages, self.token_cap):
+                    raise RuntimeError("压缩验证失败：产物无效或 token 膨胀")
 
                 # 重建 context：rotate 旧文件 → 重写 system prompt → 写入压缩结果
                 backup = self.session.rotate_turns()
@@ -406,10 +532,17 @@ class AgentLoop:
                     f"  [压缩完成] {pre_token_count} → {post_token_count} tokens"
                     f"{usage_info}, 保留 {len(self.messages)} 条消息"
                 )
+                if self.hooks:
+                    await self.hooks.emit(
+                        "on_compaction",
+                        node_id=self.node_id,
+                        pre_tokens=pre_token_count,
+                        post_tokens=post_token_count,
+                        success=True,
+                    )
                 return
 
             except Exception as e:
-                last_error = e
                 if attempt < max_retries - 1:
                     delay = base_delay * (2**attempt) + random.uniform(0, 1)
                     print(f"  [压缩重试 {attempt + 1}/{max_retries}] {type(e).__name__}: {e}，{delay:.1f}s 后重试...")
@@ -417,7 +550,22 @@ class AgentLoop:
                 else:
                     break
 
-        raise RuntimeError(f"记忆压缩失败（重试 {max_retries} 次）: {last_error}") from last_error
+        # 所有重试失败 → 截断回退
+        print(f"  [压缩] LLM 压缩失败，回退到截断策略 (原 {pre_token_count} tokens)")
+        target = int(self.token_cap * 0.7)
+        truncated = SimpleCompaction.truncate_messages(self.messages, max_tokens=target)
+        self.messages = truncated
+        post_token_count = estimate_text_tokens(self.messages)
+        print(f"  [截断完成] {pre_token_count} → {post_token_count} tokens, 保留 {len(self.messages)} 条消息")
+        if self.hooks:
+            await self.hooks.emit(
+                "on_compaction",
+                node_id=self.node_id,
+                pre_tokens=pre_token_count,
+                post_tokens=post_token_count,
+                success=False,
+                fallback="truncation",
+            )
 
     def _msg_to_dict(self, msg: Any) -> dict:
         """把 LLM 返回的消息对象转成 dict。"""

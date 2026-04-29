@@ -29,6 +29,7 @@ async def run_agent_node(
     model_registry: Any,
     tools_factory: Callable[[Session], ToolRegistry],
     depth: int = 0,
+    hooks: Any = None,
 ) -> str:
     """运行单个 Agent 节点的核心逻辑。
 
@@ -75,6 +76,7 @@ async def run_agent_node(
             model_registry=model_registry,
             tools_factory=tools_factory,
             depth=depth + 1,
+            hooks=hooks,
         )
         return json.dumps(results, ensure_ascii=False)
 
@@ -92,7 +94,12 @@ async def run_agent_node(
         max_iterations=node_config.get("max_iterations", DEFAULT_MAX_ITERATIONS),
         timeout=node_config.get("timeout", DEFAULT_NODE_TIMEOUT),
         node_id=session.node_dir.name,
+        stream=node_config.get("stream", True),
+        hooks=hooks,
     )
+    agent.approval_required = bool(node_config.get("approval_required", False))
+    agent.approval_tools = node_config.get("approval_tools", [])
+    agent.approval_timeout = float(node_config.get("approval_timeout", 300))
 
     result = await agent.run(system_prompt, node_config.get("prompt", ""))
 
@@ -100,7 +107,87 @@ async def run_agent_node(
     if not session.output_exists and result:
         session.write_file("output/draft.md", result)
 
+    # ── 输出 Schema 校验（可选）──────────────────────────────
+    output_schema = node_config.get("output_schema")
+    if output_schema and session.output_exists:
+        result = await _validate_and_correct_output(
+            session=session,
+            node_config=node_config,
+            model_registry=model_registry,
+            tools_factory=tools_factory,
+            agent=agent,
+            system_prompt=system_prompt,
+        )
+
     return result
+
+
+async def _validate_and_correct_output(
+    session: Session,
+    node_config: dict,
+    model_registry: Any,
+    tools_factory: Callable[[Session], ToolRegistry],
+    agent: AgentLoop,
+    system_prompt: str,
+) -> str:
+    """校验输出是否符合 output_schema，不符合则给 Agent 修正机会（最多 3 次）。"""
+    output_schema = node_config.get("output_schema")
+    max_attempts = 3
+
+    for attempt in range(max_attempts):
+        draft_path = session.output_dir / "draft.md"
+        if not draft_path.exists():
+            return ""
+
+        raw = draft_path.read_text(encoding="utf-8")
+
+        # 尝试解析 JSON
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            if attempt < max_attempts - 1:
+                print(f"  [校验] JSON 解析失败 (attempt {attempt + 1}/{max_attempts}): {e}")
+                correction_msg = (
+                    f"你的输出无法被解析为 JSON: {e}。请重新输出纯 JSON 对象，不要用 markdown 代码块包裹。"
+                )
+                agent.messages.append({"role": "user", "content": correction_msg})
+                result = await agent.run(system_prompt, "请修正你的输出格式。")
+                if not session.output_exists and result:
+                    session.write_file("output/draft.md", result)
+                continue
+            else:
+                return raw
+
+        # 验证 JSON Schema（如果 jsonschema 可用）
+        try:
+            import jsonschema
+
+            jsonschema.validate(parsed, output_schema)
+        except ImportError:
+            pass  # jsonschema 未安装，跳过深度校验
+        except jsonschema.ValidationError as e:
+            if attempt < max_attempts - 1:
+                print(f"  [校验] Schema 校验失败 (attempt {attempt + 1}/{max_attempts}): {e.message}")
+                correction_msg = (
+                    f"你的输出不符合要求的 JSON Schema: {e.message}。"
+                    "请根据 schema 要求修正后重新输出。"
+                )
+                agent.messages.append({"role": "user", "content": correction_msg})
+                result = await agent.run(system_prompt, "请根据 schema 修正你的输出。")
+                if not session.output_exists and result:
+                    session.write_file("output/draft.md", result)
+                continue
+            else:
+                return raw
+        else:
+            print("  [校验] Schema 校验通过 ✓")
+            break
+
+    # 读取最终产物
+    draft_path = session.output_dir / "draft.md"
+    if draft_path.exists():
+        return draft_path.read_text(encoding="utf-8")
+    return ""
 
 
 async def run_sub_dag(
@@ -109,6 +196,7 @@ async def run_sub_dag(
     model_registry: Any,
     tools_factory: Callable[[Session], ToolRegistry],
     depth: int = 0,
+    hooks: Any = None,
 ) -> dict[str, str]:
     """运行子 DAG，自动退化 Base Case。
 
@@ -147,9 +235,28 @@ async def run_sub_dag(
             for p in available_files:
                 files_section += f'- read_file("input/{p}")\n'
 
+        schema_section = ""
+        output_schema = node_cfg.get("output_schema")
+        if output_schema:
+            try:
+                schema_json = json.dumps(output_schema, ensure_ascii=False, indent=2)
+                schema_section = f"""
+## 输出格式要求
+
+你的最终产物必须是符合以下 JSON Schema 的有效 JSON，写入 output/draft.md：
+
+```json
+{schema_json}
+```
+
+请确保输出是一个纯 JSON 对象，不要用 markdown 代码块包裹，不要加任何前缀或后缀文字。
+"""
+            except (TypeError, ValueError):
+                pass
+
         hints = f"""# 任务: {node_id}
 ## 提示
-{node_cfg.get("prompt", "")}{files_section}
+{node_cfg.get("prompt", "")}{files_section}{schema_section}
 ## 规则
 - 用 read_file / write_file 工具操作文件
 - 按需读取 input/ 下的内容，不要一次性加载所有
@@ -166,6 +273,7 @@ async def run_sub_dag(
                 model_registry=model_registry,
                 tools_factory=tools_factory,
                 depth=depth,
+                hooks=hooks,
             )
             session.set_state("status", "completed")
             return {node_id: "COMPLETED"}
@@ -179,4 +287,5 @@ async def run_sub_dag(
     # ── Recursive Step ───────────────────────────────────────────
     scheduler = DAGScheduler(workspace, f"subdag_{depth}")
     scheduler.dag = dag_spec
+    scheduler.hooks = hooks
     return await scheduler.run(tools_factory=tools_factory)
