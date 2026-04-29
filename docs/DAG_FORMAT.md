@@ -42,14 +42,20 @@ nodes:
 |------|------|------|------|
 | `dag.name` | 否 | string | DAG 名称 |
 | `dag.max_parallel` | 否 | int | 最大并行节点数 |
+| `dag.webhooks` | 否 | dict | Webhook URL 配置（`on_node_complete`、`on_node_error`） |
 | `nodes.<id>.prompt` | **是** | string | 发给 Agent 的任务描述 |
 | `nodes.<id>.model` | 否 | string | 模型别名（需在 models.yaml 中定义） |
 | `nodes.<id>.deps` | 否 | list[string] | 依赖节点 ID |
-| `nodes.<id>.inputs` | 否 | list[string] | 复制到节点 `.context/` 的文件 |
+| `nodes.<id>.inputs` | 否 | list[string] | 从 DAG 根目录复制到节点 `input/` 的文件 |
 | `nodes.<id>.dep_inputs` | 否 | list[{from, to}] | 从上游节点复制产物 |
-| `nodes.<id>.max_iterations` | 否 | int | Agent 最大迭代轮数 |
-| `nodes.<id>.timeout` | 否 | int | 节点超时秒数 |
-| `nodes.<id>.retries` | 否 | int | 失败重试次数 |
+| `nodes.<id>.max_iterations` | 否 | int | Agent 最大迭代轮数，默认 50 |
+| `nodes.<id>.timeout` | 否 | int | 节点超时秒数，默认 600 |
+| `nodes.<id>.retries` | 否 | int | 失败重试次数，默认 3 |
+| `nodes.<id>.stream` | 否 | bool | 流式输出，默认 true |
+| `nodes.<id>.output_schema` | 否 | dict | JSON Schema，Agent 输出将自动校验 |
+| `nodes.<id>.approval_required` | 否 | bool | 工具调用需人工审批，默认 false |
+| `nodes.<id>.approval_tools` | 否 | list[string] | 需审批的工具列表，默认全部 |
+| `nodes.<id>.approval_timeout` | 否 | int | 审批超时秒数，默认 300 |
 
 ### 产物规则
 
@@ -126,7 +132,48 @@ nodes:
         to: "biz.md"
 ```
 
-## 示例 3：带输入文件
+## 示例 3：结构化输出
+
+```yaml
+dag:
+  name: "数据提取"
+
+nodes:
+  extract:
+    prompt: "从 input/articles.md 中提取关键信息，以 JSON 输出"
+    model: "deepseek-pro"
+    inputs: ["articles.md"]
+    output_schema:
+      type: object
+      properties:
+        title: {type: string}
+        entities:
+          type: array
+          items:
+            type: object
+            properties:
+              name: {type: string}
+              type: {type: string}
+            required: [name, type]
+      required: [title, entities]
+```
+
+## 示例 4：带审批
+
+```yaml
+dag:
+  name: "安全操作"
+
+nodes:
+  cleanup:
+    prompt: "清理 workspace/ 下的临时文件"
+    model: "deepseek-flash"
+    approval_required: true
+    approval_tools: ["run_shell"]
+    approval_timeout: 120
+```
+
+## 示例 5：带输入文件
 
 ```yaml
 dag:

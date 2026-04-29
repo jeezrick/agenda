@@ -117,6 +117,15 @@ agenda models validate          # 验证模型配置（检查 api_key 等）
 agenda models list --config ./custom/models.yaml
 ```
 
+### 9. 审批管理
+
+当节点配置了 `approval_required: true` 时，工具调用需要人工批准：
+
+```bash
+agenda node approve ./myproject/dag.yaml --node outline
+agenda node reject ./myproject/dag.yaml --node outline
+```
+
 ---
 
 ## DAG YAML 格式
@@ -160,12 +169,46 @@ nodes:
 | `nodes.<id>.max_iterations` | 否 | Agent 最大迭代轮数，默认 50 |
 | `nodes.<id>.timeout` | 否 | 节点超时秒数，默认 600 |
 | `nodes.<id>.retries` | 否 | 失败重试次数，默认 3 |
+| `nodes.<id>.stream` | 否 | 是否启用流式输出，默认 true |
+| `nodes.<id>.output_schema` | 否 | JSON Schema 定义输出格式，自动校验 |
+| `nodes.<id>.approval_required` | 否 | 工具调用是否需要人工审批，默认 false |
+| `nodes.<id>.approval_tools` | 否 | 需要审批的工具列表，默认所有工具 |
+| `nodes.<id>.approval_timeout` | 否 | 审批超时秒数，默认 300 |
 
 ### 产物规则
 
 - **完成标记**：Agent 写入 `output/draft.md` 即表示完成
 - **自定义标记**：`done_file: "output/report.md"`
 - **下游读取**：通过 `dep_inputs` 把上游 `output/` 复制到下游 `input/`
+
+### 示例：结构化输出 + 审批
+
+```yaml
+dag:
+  name: "数据分析"
+  max_parallel: 2
+
+nodes:
+  analyze:
+    prompt: "分析 input/data.csv，输出结构化结果"
+    model: "deepseek-pro"
+    output_schema:
+      type: object
+      properties:
+        summary: {type: string}
+        key_metrics: {type: array, items: {type: number}}
+        recommendations: {type: array, items: {type: string}}
+
+  deploy:
+    prompt: "读取分析结果，执行部署脚本"
+    model: "deepseek-flash"
+    deps: [analyze]
+    approval_required: true
+    approval_tools: ["run_shell"]
+    dep_inputs:
+      - from: "nodes/analyze/output/draft.md"
+        to: "analysis.json"
+```
 
 ### 示例：并行 + 汇聚
 
