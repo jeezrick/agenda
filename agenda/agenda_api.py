@@ -147,9 +147,7 @@ async def _validate_and_correct_output(
         except json.JSONDecodeError as e:
             if attempt < max_attempts - 1:
                 print(f"  [校验] JSON 解析失败 (attempt {attempt + 1}/{max_attempts}): {e}")
-                correction_msg = (
-                    f"你的输出无法被解析为 JSON: {e}。请重新输出纯 JSON 对象，不要用 markdown 代码块包裹。"
-                )
+                correction_msg = f"你的输出无法被解析为 JSON: {e}。请重新输出纯 JSON 对象，不要用 markdown 代码块包裹。"
                 agent.messages.append({"role": "user", "content": correction_msg})
                 result = await agent.run(system_prompt, "请修正你的输出格式。")
                 if not session.output_exists and result:
@@ -168,10 +166,7 @@ async def _validate_and_correct_output(
         except jsonschema.ValidationError as e:
             if attempt < max_attempts - 1:
                 print(f"  [校验] Schema 校验失败 (attempt {attempt + 1}/{max_attempts}): {e.message}")
-                correction_msg = (
-                    f"你的输出不符合要求的 JSON Schema: {e.message}。"
-                    "请根据 schema 要求修正后重新输出。"
-                )
+                correction_msg = f"你的输出不符合要求的 JSON Schema: {e.message}。请根据 schema 要求修正后重新输出。"
                 agent.messages.append({"role": "user", "content": correction_msg})
                 result = await agent.run(system_prompt, "请根据 schema 修正你的输出。")
                 if not session.output_exists and result:

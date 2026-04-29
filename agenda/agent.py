@@ -140,7 +140,12 @@ class AgentLoop:
 
                 # 调用 LLM
                 if self.hooks:
-                    await self.hooks.emit("on_turn_start", iteration=iteration, node_id=self.node_id, token_count=estimate_text_tokens(self.messages))
+                    await self.hooks.emit(
+                        "on_turn_start",
+                        iteration=iteration,
+                        node_id=self.node_id,
+                        token_count=estimate_text_tokens(self.messages),
+                    )
                 response = await self._call_llm()
                 choice = response["choices"][0]
                 finish_reason = choice.get("finish_reason")
@@ -395,9 +400,23 @@ class AgentLoop:
             kwargs["tool_choice"] = "auto"
 
         standard_keys = {
-            "model", "messages", "temperature", "max_tokens", "tools", "tool_choice",
-            "stream", "stream_options", "stop", "top_p", "frequency_penalty",
-            "presence_penalty", "logprobs", "top_logprobs", "response_format", "n", "user",
+            "model",
+            "messages",
+            "temperature",
+            "max_tokens",
+            "tools",
+            "tool_choice",
+            "stream",
+            "stream_options",
+            "stop",
+            "top_p",
+            "frequency_penalty",
+            "presence_penalty",
+            "logprobs",
+            "top_logprobs",
+            "response_format",
+            "n",
+            "user",
         }
         extra_body = {k: v for k, v in kwargs.items() if k not in standard_keys}
         standard_kwargs = {k: v for k, v in kwargs.items() if k in standard_keys}

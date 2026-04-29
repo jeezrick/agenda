@@ -222,7 +222,6 @@ class NodeWatcher:
             self._scheduler.load()
             print(f"[daemon] 重载完成: {len(self._scheduler.dag.get('nodes', {}))} 个节点")
 
-
     async def _scan(self) -> list[str]:
         """扫描节点目录，启动需要运行的节点。"""
         if self._scheduler is None:
