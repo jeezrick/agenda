@@ -619,14 +619,95 @@ def _viz_dag(scheduler: DAGScheduler, mermaid: bool = False) -> str:
 
 
 def _viz_ascii(name: str, max_parallel: int, nodes: dict, node_ids: list[str]) -> str:
-    """ASCII 终端可视化。"""
-    lines = [f"DAG: {name}  ({len(node_ids)} nodes, max_parallel={max_parallel})", "=" * 50]
+    """ASCII 终端可视化 — 带 ANSI 颜色和 Unicode 框线。"""
+    B = "\033[1m"
+    D = "\033[2m"
+    C = "\033[36m"
+    M = "\033[35m"
+    Y = "\033[33m"
+    G = "\033[32m"
+    R = "\033[0m"
 
-    # ── 拓扑分层 ──────────────────────────────────
-    # 计算每个节点的层级（最长依赖链长度）
+    def mc(model: str) -> str:
+        if not model:
+            return ""
+        return M if "pro" in model.lower() else C if "flash" in model.lower() else Y
+
+    levels = get_levels(nodes, node_ids)
+    by_level: dict[int, list[str]] = {}
+    for nid, lvl in levels.items():
+        by_level.setdefault(lvl, []).append(nid)
+    max_level = max(levels.values()) if levels else 0
+    max_name = max((len(n) for n in node_ids), default=10)
+
+    lines: list[str] = []
+
+    # ── Header ─────────────────────────────────────
+    lines.append(f"  {B}╭─ {name} ─{D} {len(node_ids)} nodes · {max_parallel} parallel · {max_level + 1} level(s) {R}{B}─╮{R}")
+    lines.append(f"  {B}╰{'─' * (len(name) + len(str(len(node_ids))) + len(str(max_parallel)) + len(str(max_level + 1)) + 27)}╯{R}")
+    lines.append("")
+
+    # ── Nodes by level ─────────────────────────────
+    for lvl in range(max_level + 1):
+        batch = by_level.get(lvl, [])
+        parallel = len(batch) > 1
+        tag = f"{G}entry{R}" if lvl == 0 else f"{Y}final{R}" if lvl == max_level else f"level {lvl}"
+
+        # Level header
+        pflag = f" {G}∥ parallel{R}" if parallel else ""
+        lines.append(f"  {B}{tag}{pflag}{R}")
+
+        # Node cards
+        for nid in batch:
+            cfg = nodes[nid]
+            model = cfg.get("model", "—")
+            c = mc(model)
+            deps = cfg.get("deps", [])
+
+            name_part = f"{c}● {B}{nid}{R}"
+            pad = max_name - len(nid)
+            model_part = f"{D}{model}{R}"
+            dep_part = ""
+            if deps:
+                dep_list = ", ".join(f"{Y}{d}{R}" for d in deps)
+                dep_part = f"  {D}← {dep_list}{R}"
+
+            lines.append(f"    {name_part}{' ' * pad}  {model_part}{dep_part}")
+
+        # Arrow between levels
+        if lvl < max_level:
+            next_batch = by_level.get(lvl + 1, [])
+            if batch and next_batch:
+                arrows = []
+                for _b in batch:
+                    arrows.append(f"{D}│{R}")
+                arrow_line = " ".join(arrows)
+                lines.append(f"    {arrow_line}")
+                # Show which way the arrows point
+                for dst in next_batch:
+                    srcs = [d for d in nodes[dst].get("deps", []) if d in batch]
+                    if srcs:
+                        lines.append(f"    {D}╰─► {dst}{R}")
+
+        lines.append("")
+
+    # ── Legend ─────────────────────────────────────
+    parts = []
+    if any(len(b) > 1 for b in by_level.values()):
+        parts.append(f"{G}∥ parallel{R}")
+    parts.append(f"{C}● flash{R}")
+    parts.append(f"{M}● pro{R}")
+    if parts:
+        lines.append(f"  {D}{' · '.join(parts)}{R}")
+
+    return "\n".join(lines)
+
+
+def get_levels(nodes: dict, node_ids: list[str]) -> dict[str, int]:
+    """计算每个节点的层级（最长依赖链长度）。"""
     levels: dict[str, int] = {}
 
-    def get_level(nid: str, visited: set | None = None) -> int:
+    def compute(nid: str, visited: set | None = None) -> int:
         if visited is None:
             visited = set()
         if nid in visited:
@@ -635,53 +716,13 @@ def _viz_ascii(name: str, max_parallel: int, nodes: dict, node_ids: list[str]) -
             return levels[nid]
         visited.add(nid)
         deps = nodes.get(nid, {}).get("deps", [])
-        lvl = 0 if not deps else 1 + max(get_level(d, visited.copy()) for d in deps)
+        lvl = 0 if not deps else 1 + max(compute(d, visited.copy()) for d in deps)
         levels[nid] = lvl
         return lvl
 
     for nid in node_ids:
-        get_level(nid)
-
-    # 按层级分组
-    by_level: dict[int, list[str]] = {}
-    for nid, lvl in levels.items():
-        by_level.setdefault(lvl, []).append(nid)
-
-    max_level = max(levels.values()) if levels else 0
-
-    # ── 渲染层级 ──────────────────────────────────
-    for lvl in range(max_level + 1):
-        batch = by_level.get(lvl, [])
-        if lvl == 0:
-            lines.append(f"\n  Level {lvl} (starting nodes):")
-        elif lvl == max_level:
-            lines.append(f"\n  Level {lvl} (final nodes):")
-        else:
-            lines.append(f"\n  Level {lvl}:")
-
-        for nid in batch:
-            cfg = nodes[nid]
-            model = cfg.get("model", "default")
-            deps = cfg.get("deps", [])
-            deps_str = f"  ← depends on: [{', '.join(deps)}]" if deps else "  (no dependencies)"
-            marker = ""
-
-            # 并行标记：同层无依赖节点标注
-            if lvl == 0 and len(batch) > 1:
-                marker = " ⚡parallel"
-            elif lvl > 0:
-                sibling_deps = [d for n in batch for d in nodes[n].get("deps", [])]
-                if len(batch) > 1 and len(set(sibling_deps)) == len(sibling_deps):
-                    marker = " ⚡parallel"
-
-            lines.append(f"    ◉ {nid} [{model}]{marker}{deps_str}")
-
-    # ── 汇总 ──────────────────────────────────
-    lines.append(f"\n{'=' * 50}")
-    lines.append(f"Total: {len(node_ids)} nodes, {max_level} level(s)")
-    lines.append("Legend: ⚡parallel = can run concurrently")
-
-    return "\n".join(lines)
+        compute(nid)
+    return levels
 
 
 def _viz_mermaid(name: str, max_parallel: int, nodes: dict, node_ids: list[str]) -> str:
