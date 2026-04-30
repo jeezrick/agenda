@@ -80,6 +80,23 @@ agenda(dag, inputs, depth=0)
 
 ---
 
+## 功能一览
+
+| 功能 | 说明 |
+|------|------|
+| 流式输出 | SSE 逐 token 实时输出，支持 tool_call delta 拼装 |
+| 并行工具 | `asyncio.gather` 并发执行工具，减少 LLM 往返 |
+| 记忆压缩 | LLM 驱动 + 验证 + 截断回退，专用压缩模型 |
+| 结构化输出 | JSON Schema 契约，自动校验 + 修正重试 |
+| 钩子系统 | 6 个生命周期钩子，支持同步/异步回调 |
+| 人机协作 | 工具调用审批门，CLI approve/reject |
+| 守护进程 | DAG 文件热重载、指标收集、Webhook 通知 |
+| 崩溃恢复 | 调度器状态持久化 + turn 级别断点续执行 |
+| 递归分解 | Agent 可调用 `agenda()` 创建子 DAG |
+| 安全边界 | Guardian 路径隔离，防 symlink 逃逸 |
+
+---
+
 ## 关键原则：Main Agent 与 Subagent 没有区别
 
 **所有 Agent 共享同一个 Agent Loop 实现。**
@@ -255,19 +272,27 @@ if len(dag.nodes) == 1:
 
 ## 已实现项
 
-1. ✅ **删除 `subagent.py`** — Subagent 没有特殊逻辑，递归通过 Agent 调用 `agenda()` 实现
-2. ✅ **Agent 可调用 `agenda()`** — Agent Loop 里的 Agent 构造子 DAG 后直接调用 `agenda()` 实现递归
-3. ✅ **Base Case 优化** — 单节点 DAG 跳过 Scheduler，直接 `AgentLoop.run()`
-4. ✅ **`agenda()` 顶层函数** — 统一入口，替代当前的直接 Scheduler 调用
+1. ✅ **流式输出 (SSE)** — Agent 运行时实时逐 token 输出，tool_call delta 正确拼装
+2. ✅ **并行工具调用** — `asyncio.gather` 并发执行工具，批处理节流，异常隔离
+3. ✅ **记忆压缩 2.0** — 保留 4 条消息 + 压缩后验证 + 截断回退 + 专用压缩模型
+4. ✅ **结构化输出契约** — DAG YAML 支持 `output_schema`（JSON Schema），自动校验 + 修正重试
+5. ✅ **钩子系统** — HookRegistry 6 个生命周期钩子（on_node_start/complete/error、on_turn_start、on_tool_call、on_compaction）
+6. ✅ **人机协作审批** — 工具调用审批门（events.jsonl IPC），CLI `approve`/`reject` 命令
+7. ✅ **守护进程 2.0** — DAG 文件监听 + MetricsHook + WebhookHook
+8. ✅ **删除 `subagent.py`** — Subagent 没有特殊逻辑，递归通过 Agent 调用 `agenda()` 实现
+9. ✅ **Agent 可调用 `agenda()`** — Agent 构造子 DAG 后直接调用 `agenda()` 实现递归
+10. ✅ **Base Case 优化** — 单节点 DAG 跳过 Scheduler，直接 `AgentLoop.run()`
+11. ✅ **`agenda()` 顶层函数** — 统一入口，替代当前的直接 Scheduler 调用
 
 ## 待实现项
 
-1. **Checkpoint/回滚** — Kimi CLI 风格的 `revert_to(checkpoint_id)`
-2. **Session Memory Compaction** — Claude Code 风格的零成本压缩（成熟期）
-3. **DAG 动态修改** — 运行时添加/删除节点
+1. **Fork 模式** — 子 Agent 上下文传递策略（Codex 风格：None/FullHistory/LastNTurns）
+2. **模型降档** — 上下文紧张时自动切换到更大容量模型
+3. **Agent 间通信** — 基于 events.jsonl 的运行时 Agent 消息传递
 
 ## 测试
 
-- **141 个测试全部通过**，覆盖核心运行时（AgentLoop、Scheduler、Session、Guardian、Compaction）
-- CI/CD: GitHub Actions 自动跑 pytest + coverage（Python 3.10/3.11/3.12）
+- **203 个测试全部通过**，5 个跳过（端到端实时测试需 `RUN_LIVE_TESTS=1`），覆盖所有核心模块
+- 15 个源文件，约 3,750 行 Python，零必需新依赖（PyYAML、Jinja2、OpenAI、tiktoken-可选）
+- CI/CD: GitHub Actions — ruff + ruff format + mypy strict + pytest（Python 3.10/3.11）
 - 覆盖率: 核心模块 80%+

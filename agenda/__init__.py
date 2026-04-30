@@ -15,7 +15,7 @@
 依赖：标准库 + pyyaml + jinja2 + openai
 """
 
-__version__ = "0.0.6"
+__version__ = "0.0.7"
 
 from pathlib import Path
 from typing import Any

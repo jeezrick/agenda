@@ -338,7 +338,7 @@ class AgentLoop:
         usage: dict | None = None
 
         prefix = f"[{self.node_id}] " if self.node_id else ""
-        stream = client.chat.completions.create(**kwargs)
+        stream = await client.chat.completions.create(**kwargs)
         async for chunk in stream:
             if not chunk.choices:
                 # 最后一个 chunk（只含 usage，无 choices）

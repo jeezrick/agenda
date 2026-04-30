@@ -505,6 +505,15 @@ def _run_dag(dag_path: Path, models_path: Path | None, max_parallel: int) -> int
     scheduler.dag["dag"]["max_parallel"] = max_parallel
 
     from . import agenda as _agenda
+    from .daemon import WebhookHook
+    from .hook import HookRegistry
+    from .metrics import MetricsHook
+
+    hooks = HookRegistry()
+    MetricsHook(scheduler.dag_dir / ".system").register_all(hooks)
+    webhooks_cfg = scheduler.dag.get("dag", {}).get("webhooks")
+    if webhooks_cfg:
+        WebhookHook(webhooks_cfg).register_all(hooks)
 
     results = asyncio.run(
         _agenda(
@@ -512,6 +521,7 @@ def _run_dag(dag_path: Path, models_path: Path | None, max_parallel: int) -> int
             workspace=scheduler.dag_dir,
             model_registry=scheduler.model_registry,
             tools_factory=lambda session: build_tools(session),
+            hooks=hooks,
         )
     )
     _json_out({"results": results})

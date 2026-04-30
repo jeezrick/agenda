@@ -103,8 +103,8 @@ async def run_agent_node(
 
     result = await agent.run(system_prompt, node_config.get("prompt", ""))
 
-    # 写入产物（如果 Agent 没有自己写）
-    if not session.output_exists and result:
+    # 写入产物（Agent 可能直接写 tool，这里兜底）
+    if result and not session.output_exists:
         session.write_file("output/draft.md", result)
 
     # ── 输出 Schema 校验（可选）──────────────────────────────
@@ -132,6 +132,10 @@ async def _validate_and_correct_output(
 ) -> str:
     """校验输出是否符合 output_schema，不符合则给 Agent 修正机会（最多 3 次）。"""
     output_schema = node_config.get("output_schema")
+    if not output_schema:
+        draft_path = session.output_dir / "draft.md"
+        return draft_path.read_text(encoding="utf-8") if draft_path.exists() else ""
+
     max_attempts = 3
 
     for attempt in range(max_attempts):
@@ -150,7 +154,7 @@ async def _validate_and_correct_output(
                 correction_msg = f"你的输出无法被解析为 JSON: {e}。请重新输出纯 JSON 对象，不要用 markdown 代码块包裹。"
                 agent.messages.append({"role": "user", "content": correction_msg})
                 result = await agent.run(system_prompt, "请修正你的输出格式。")
-                if not session.output_exists and result:
+                if result:
                     session.write_file("output/draft.md", result)
                 continue
             else:
@@ -169,7 +173,7 @@ async def _validate_and_correct_output(
                 correction_msg = f"你的输出不符合要求的 JSON Schema: {e.message}。请根据 schema 要求修正后重新输出。"
                 agent.messages.append({"role": "user", "content": correction_msg})
                 result = await agent.run(system_prompt, "请根据 schema 修正你的输出。")
-                if not session.output_exists and result:
+                if result:
                     session.write_file("output/draft.md", result)
                 continue
             else:
