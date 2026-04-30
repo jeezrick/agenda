@@ -1,6 +1,41 @@
 from __future__ import annotations
 
-"""工具注册表与工具工厂。"""
+"""工具注册表 — Agent 可调用的函数集合。
+
+## 设计理念
+
+ToolRegistry 是 Agent 与外部世界交互的唯一接口。
+每个工具是一个普通 Python 函数，接收参数、返回字符串。
+注册表负责：
+    - 管理工具列表
+    - 生成 OpenAI function calling 格式的 JSON Schema
+    - 生成 LLM 可见的纯文本工具描述
+
+## 工具注册
+
+两种用法：
+    @tools.register("name")       ← 装饰器
+    tools.register("name", func)  ← 直接注册
+
+## Schema 推断
+
+`_infer_schema` 从函数签名自动推断 JSON Schema：
+    - str → {"type": "string"}
+    - int → {"type": "integer"}
+    - bool → {"type": "boolean"}
+    - float → {"type": "number"}
+    - 无默认值的参数 → required 列表
+
+## 内置工具
+
+    read_file(path)           — 读取 input/ workspace/ output/ 下的文件
+    write_file(path, content) — 写入 workspace/ 或 output/
+    list_dir(path)            — 列出目录内容
+    done_compact()            — 通知系统记忆压缩完成
+    run_shell(command)        — 执行 shell 命令（需 allow_shell=True）
+
+所有工具的操作都被 Guarding 限制在节点目录内。
+"""
 
 import inspect
 from collections.abc import Callable

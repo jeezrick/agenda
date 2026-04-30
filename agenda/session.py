@@ -1,21 +1,46 @@
 from __future__ import annotations
 
-"""Session — 三目录隔离 + Turn 持久化 + IPC。
+"""Session — 三目录隔离 + Turn 持久化 + IPC 事件。
 
-目录结构：
+## 设计理念
+
+文件系统即状态。每个 Session 是一个目录，目录结构本身就是状态机：
+- input/ 有文件 = 有输入
+- output/draft.md 存在 = 完成
+- .system/error.log 存在 = 失败
+- .system/turns.jsonl = 对话历史（可恢复）
+
+不需要数据库、不需要内存状态、不需要序列化协议。
+崩溃后看一眼目录就知道发生了什么。
+
+## 目录结构
+
     nodes/{node_id}/
-        input/        ← 系统输入（Agent 只读）
-            由 prepare_node 复制 inputs + dep_inputs
-        workspace/    ← Agent 工作区（可读写）
-            草稿、笔记、中间产物
-        output/       ← Agent 最终产物（可写）
-            默认 output/draft.md 为完成标记
-        .system/      ← 系统私有（Agent 不可见）
-            turns.jsonl     ← 对话历史（turn 级别，append-only）
-            events.jsonl    ← IPC 事件队列
-            state.json      ← 运行状态
-            hints.md        ← 系统提示
-        children/     ← 子 Agent 的 session
+        input/        ← 系统输入（由 prepare_node 复制），Agent 只读
+        workspace/    ← Agent 工作区（草稿、笔记、中间产物），可读写
+        output/       ← Agent 最终产物（默认 draft.md 为完成标记），可写
+        .system/      ← 系统私有，Agent 不可见
+            turns.jsonl     ← turn 级别对话持久化（append-only JSONL）
+            events.jsonl    ← IPC 事件队列（外部中断、消息、审批）
+            state.json      ← 键值运行状态（status、时间戳等）
+            hints.md        ← 系统提示（由 prepare_node 写入）
+        children/     ← 子 Agent 的 session（嵌套递归）
+
+## 三目录隔离
+
+Agent 的可见世界只有三个目录：
+- input/：系统注入的文件（依赖产物、参考材料），只读
+- workspace/：Agent 的工作区，可自由读写
+- output/：最终产物，可写
+
+Guardian 通过 `relative_to` 实现硬边界：任何试图访问三目录之外的路径都会被拒绝。
+这与 Codex 的 Workspace 隔离设计一致。
+
+## Turn 持久化
+
+每轮 Agent 执行后，消息以 JSONL 格式追加到 turns.jsonl。
+取消时保存 partial_turn，确保中断不丢失上下文。
+压缩时 rotate 旧 turns 到备份文件，然后清空重写。
 """
 
 import contextlib

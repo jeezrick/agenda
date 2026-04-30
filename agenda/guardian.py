@@ -1,13 +1,27 @@
 from __future__ import annotations
 
-"""Guardian — 文件系统路径边界。
+"""Guardian — 文件系统路径边界守卫。
 
-学 Butterfly 的设计：
-- resolve_target(): 把路径 resolve 成绝对路径（相对路径 join 到 root）
-- is_allowed(): 检查是否在 root 内（用 relative_to，防 symlink 逃逸）
-- check(): 不允许时抛 PermissionError
+## 设计理念
 
-所有 Agent 的文件操作工具都必须经过 Guardian 检查。
+学 Butterfly 的路径沙箱设计。Guardian 是一个纯路径层面的安全层：
+    - 所有 Agent 的文件操作都锚定在 node_dir 内
+    - 相对路径默认 join 到 root，防止读取系统文件
+    - resolve() 后检查 relative_to，防止 symlink 逃逸
+    - 两种级别的检查：root 边界（check）和语义边界（Session._resolve_safe）
+
+## 安全模型
+
+    Guardian.check("../../etc/passwd")
+      → resolve → ~/project/nodes/x/../../etc/passwd → /etc/passwd
+      → relative_to(root) → ValueError → PermissionError
+
+    Guardian.check("input/evil_link")
+      → 如果 symlink 指向 /etc/passwd，resolve 会跟过去
+      → relative_to(root) → ValueError → PermissionError
+
+不需要文件系统权限、不需要 chroot、不需要容器。
+纯 Python Path 操作实现的安全边界。
 """
 
 from pathlib import Path

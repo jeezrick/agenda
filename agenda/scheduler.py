@@ -1,6 +1,48 @@
 from __future__ import annotations
 
-"""DAG 调度器（完善版）。"""
+"""DAG 调度器 — 拓扑排序 + 异步并行调度 + 崩溃恢复。
+
+## 设计理念
+
+DAGScheduler 是 Agenda 的编排层。它接收一个 DAG 定义（YAML/字典），
+负责：
+    - 解析节点依赖
+    - 拓扑排序（Kahn 算法）
+    - 环路检测（DFS 三色标记）
+    - 异步并行调度（不超过 max_parallel）
+    - 崩溃恢复（scheduler_state.json 持久化）
+    - 节点重试（失败后最多重试 N 次）
+    - 死锁检测（所有剩余节点被失败节点阻塞时终止）
+
+## Base Case 优化
+
+单节点 DAG 直接走 `_run_node()`，不创建 scheduler_state.json、
+不启动调度循环。这是 Agenda 架构的核心优化：最简情况 = 最小开销。
+
+## 调度循环
+
+    while 还有未完成节点:
+        1. 清理已完成的 task
+        2. 检查失败节点是否阻塞所有下游 → 终止
+        3. 死锁检测（ready=空 且 running=空 但 有 remaining）
+        4. 启动 ready_nodes（不超过 max_parallel - running）
+        5. await FIRST_COMPLETED（或 1s 超时轮询）
+
+## 节点重试
+
+- 节点失败 → 检查 retries 是否 < max_retry
+- 可重试 → 清除 error.log，放到下一轮 ready_nodes
+- 不可重试 → 加入 failed 集合
+- 失败节点阻塞下游节点 → 那些节点不会启动
+
+## 崩溃恢复
+
+调度器状态定期持久化到 `.system/scheduler_state.json`（原子写入）。
+重启时：
+    - 已完成节点 → 直接从文件系统识别（output/draft.md 存在）
+    - 正在运行的节点 → 重新分类（检查是否已完成/失败/中断）
+    - 失败的节点 → 检查重试次数，决定重试或放弃
+"""
 
 import asyncio
 import json

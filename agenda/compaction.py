@@ -1,11 +1,38 @@
 from __future__ import annotations
 
-"""Context compaction — 系统驱动记忆压缩。
+"""Context Compaction — LLM 驱动的记忆压缩。
 
-学 Kimi Code CLI 的设计：
-- should_auto_compact: 双策略触发（ratio + reserved）
-- SimpleCompaction: 保留最近 N 条消息，前面的交给 LLM 生成结构化摘要
-- 压缩 LLM 使用固定 system prompt，不赋予工具调用能力
+## 设计理念
+
+学 Kimi Code CLI + Codex Memento 策略。
+
+LLM 的上下文窗口有限（如 64K tokens）。当对话历史接近上限时，需要
+压缩旧消息为结构化摘要，为新消息腾出空间。
+
+压缩流程：
+    1. prepare() — 将消息列表分为「待压缩」和「保留」两部分
+    2. compact() — 用 LLM 将待压缩部分总结为结构化摘要
+    3. validate_compacted() — 验证压缩产物有效（非空、未膨胀）
+    4. truncate_messages() — LLM 压缩失败时的回退截断策略
+
+## 双策略触发（should_auto_compact）
+
+    条件 1：token_count >= max_context * trigger_ratio（如 75%）
+    条件 2：token_count + reserved >= max_context
+    满足任一即触发。参考 Kimi Code CLI 的设计。
+
+## Tool Pair 完整性保证（_ensure_tool_pair_integrity）
+
+压缩边界可能切在 assistant(tool_use) / tool(tool_result) 对中间。
+如果 LLM 收到孤立的 tool_result 或孤立的 tool_use，会报 400 错误。
+所以边界向前调整，确保所有 tool 对要么全在保留区，要么全在压缩区。
+
+参考 Claw Code + Claude Code 的边界安全设计。
+
+## 保留策略
+
+只计数 user/assistant 消息。system 和 tool 消息不占保留配额。
+默认保留 4 条 user/assistant 消息（含工具对完整展开）。
 """
 
 from collections import namedtuple

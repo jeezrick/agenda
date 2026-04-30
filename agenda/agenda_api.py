@@ -1,11 +1,45 @@
-"""agenda() 顶层函数 — 递归调用的统一入口。
+"""agenda() API — 递归多 Agent 调度的统一入口。
 
-设计：
-- Base Case: 单节点 DAG → 直接 AgentLoop.run()，跳过 Scheduler 开销
-- Recursive Step: 多节点 DAG → Scheduler.run() 并行调度
-- agenda() 是普通函数，Agent 调用它和调用 read_file 没有区别
+## 设计理念
 
-对应 README 待实现项 #2、#3、#4。
+`agenda()` 是一个递归函数，Agent 调用它和调用 `read_file()` 一样自然。
+它是 Agenda 整个架构的核心抽象 —— 一个函数表达所有多 Agent 拓扑。
+
+## 三层结构
+
+    agenda()                          ← 公共入口（Python API）
+      └─ run_sub_dag()                ← 调度分发层
+           ├─ Base Case: 单节点      ← 直接 AgentLoop.run()
+           └─ Recursive Step: 多节点 ← DAGScheduler.run()
+
+## Base Case 优化
+
+当 DAG 只有 1 个节点时：
+    - 不创建 DAGScheduler
+    - 不创建 scheduler_state.json
+    - 直接创建 Session，注入 hints，调用 AgentLoop.run()
+    - 零调度开销
+
+## Recursive Step
+
+当 DAG 有多个节点时：
+    - 创建 DAGScheduler
+    - 注入 hooks、model_registry
+    - 调用 scheduler.run() 并行调度
+
+## agenda() 工具注入
+
+`run_agent_node` 在 Agent 的工具集中动态注入 `agenda()` 函数。
+Agent 调用 `agenda(dag_yaml)` 就能创建子 DAG —— 递归就这样自然发生了。
+Agent 永远不知道（也不需要知道）自己是第几层递归。
+
+## 结构化输出校验
+
+如果节点配置了 `output_schema`，Agent 产出后：
+    1. 解析 JSON
+    2. 用 jsonschema 验证（可选，未安装则跳过）
+    3. 不符合 → 追加修正指令 → 重新调用 agent.run()
+    4. 最多 3 次修正，仍不合格则返回原始产物
 """
 
 from __future__ import annotations

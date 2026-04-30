@@ -1,6 +1,39 @@
 from __future__ import annotations
 
-"""模型注册表 — 多模型配置。"""
+"""模型注册表 — 多 LLM 配置管理。
+
+## 设计理念
+
+用 YAML 文件声明多个 LLM 配置，通过别名引用。
+支持三层加载优先级：
+    1. DAG 工作区内的 models.yaml（本地优先）
+    2. ~/.agenda/models.yaml（全局配置）
+    3. 环境变量回退（AGENDA_BASE_URL 等）
+
+## ModelConfig 字段
+
+    name            — 别名（如 "deepseek-flash"），用于 DAG YAML 引用
+    model           — 实际模型 ID（如 "deepseek-v4-flash"）
+    base_url / api_key — OpenAI 兼容 API 端点
+    token_cap       — 上下文窗口上限（用于压缩触发判断）
+    temperature     — 采样温度（Agent 推荐 1.0）
+    max_tokens      — 最大输出 token 数
+    stream          — 是否启用流式输出
+    compact_model   — 专用压缩模型别名（省钱/加速）
+    fallback_model  — 主模型失败时的备用模型（自动切换）
+    extra_params    — provider-specific 参数透传（如 thinking、reasoning_effort）
+
+## ${ENV_VAR} 语法
+
+配置中的字符串值支持 `${VAR}` 语法解析环境变量：
+    api_key: "${DEEPSEEK_API_KEY}"  →  从环境变量读取
+
+## Fallback 策略
+
+当 LLM 调用遇到网络/服务端错误时（APIConnectionError、Timeout、
+InternalServerError、RateLimitError），自动切换到 fallback_model。
+代码错误（如 TypeError）不会触发 fallback，直接向上传播。
+"""
 
 import os
 import re

@@ -1,12 +1,45 @@
 from __future__ import annotations
 
-"""Daemon 模式 — 长期运行的 Agenda Server。
+"""Daemon 模式 — 长期运行的 Agenda 服务。
 
-学 Butterfly 的 server.py + watcher.py 设计：
-- PID 文件 + flock 单例保护
-- SIGTERM/SIGINT 优雅关闭
-- SessionWatcher 扫描 DAG 目录，管理节点 task
-- 自动恢复 crashed session
+## 设计理念
+
+学 Butterfly 的 server.py + watcher.py 设计。
+
+Daemon 是一个常驻进程，持续监视 DAG 目录：
+    - 发现新节点 → 启动 task
+    - 节点完成 → 记录
+    - 节点失败 → 检查重试
+    - DAG 文件变更 → 热重载
+
+## NodeWatcher
+
+核心组件。1 秒轮询循环：
+    1. 扫描 nodes/ 目录
+    2. 找到就绪节点（依赖满足）→ asyncio.create_task 启动
+    3. 清理已完成的 task
+    4. 检查失败节点重试
+    5. 检查 DAG 文件变更（watchdog 或 mtime 轮询 + 300ms 防抖）
+
+## PID/Lock 单例保护
+
+- PID 文件：防止多实例（agenda.pid）
+- flock 文件锁：跨进程互斥（agenda.lock）
+- SIGTERM/SIGINT 优雅关闭：清理 PID、释放锁、取消所有 task
+
+## DAG 文件监听
+
+支持两种模式：
+    1. watchdog（pip install watchdog）—— 实时文件变更通知
+    2. mtime 轮询 —— 零依赖回退，1 秒探测 + 300ms 防抖
+
+## WebhookHook
+
+基于 HookRegistry 的纯标准库 HTTP 通知：
+    - on_node_complete → POST JSON
+    - on_node_error → POST JSON
+    - 使用 urllib.request（零额外依赖）
+    - 失败不影响 DAG 执行（fire-and-forget）
 """
 
 import asyncio

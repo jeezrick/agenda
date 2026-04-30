@@ -1,18 +1,46 @@
 """Agenda — DAG-native Agent Runtime with Multi-Agent support.
 
-设计原则：
-- 文件系统即状态
-- 目录即 Session
-- 双目录隔离
-- DAG 原生
-- Hook 即策略
-- AI 自压缩记忆
-- 子 Agent 嵌套
+## 一句话
 
-核心 API:
-    asyncio.run(agenda(dag_spec, workspace))
+Agenda 是一个给 Agent 调度 Agent 的极简 DAG 运行时。
+你把任务写成 DAG YAML，Agenda 自动并行调度、执行、传递产物。
 
-依赖：标准库 + pyyaml + jinja2 + openai
+## 核心理念
+
+    agenda(dag, inputs, depth=0) 是一个递归函数：
+    - 单节点 DAG → Base Case → 直接 AgentLoop.run()
+    - 多节点 DAG → Recursive Step → Scheduler.run() 并行调度
+    - Agent 可以调用 agenda() 创建子 DAG → 递归发生
+
+## 七大设计原则
+
+    1. 文件系统即状态  — 没有数据库，产物就是文件，状态就是目录结构
+    2. 目录即 Session   — 每个 Agent 节点对应一个目录，独立隔离
+    3. 三目录隔离       — input(只读)/workspace(读写)/output(可写)+暗区.system
+    4. DAG 原生         — 任务编排用 DAG 表达，支持拓扑排序、并行调度、崩溃恢复
+    5. Hook 即策略      — 指标、通知、审批等横切关注点通过钩子系统实现
+    6. AI 自压缩记忆    — LLM 驱动的上下文压缩，保持 Agent 长对话可用性
+    7. 子 Agent 嵌套    — Agent 可递归分解任务，Main Agent 与 Subagent 共享同一实现
+
+## 核心 API
+
+    import asyncio
+    from agenda import agenda
+
+    dag = {
+        "dag": {"name": "example", "max_parallel": 4},
+        "nodes": {
+            "research": {"prompt": "调研..."},
+            "write": {"prompt": "写作...", "deps": ["research"]},
+        },
+    }
+    results = asyncio.run(agenda(dag, "/tmp/work"))
+    # → {"research": "COMPLETED", "write": "COMPLETED"}
+
+## 依赖
+
+标准库 + pyyaml + jinja2 + openai（核心运行时）。
+可选：tiktoken（精确 token 估算）、watchdog（文件监听）、jsonschema（结构化输出深度校验）。
 """
 
 __version__ = "0.0.7"

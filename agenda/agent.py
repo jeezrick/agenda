@@ -1,15 +1,50 @@
 from __future__ import annotations
 
-"""Agent Loop — 核心循环（加固版）。
+"""Agent Loop — LLM 核心交互循环。
 
-学 Butterfly + EVA + Kimi Code 的加固措施：
-- max_iterations: 防止无限循环（默认 50）
-- timeout: 节点级超时（默认 600s）
-- turn 级别持久化（每轮后 save_turn，取消时 save_partial_turn）
-- IPC 事件轮询（每轮前检查 events.jsonl，支持外部中断/消息）
-- 取消时补全 pending tool_calls（防止下次运行 400）
-- 系统驱动记忆压缩（SimpleCompaction，保留最近 N 条，LLM 生成结构化摘要）
+## 设计理念
+
+AgentLoop 是 Agenda 的核心引擎。一个 AgentLoop 实例 = 一个活的 Agent：
+- 它有对话历史（self.messages）
+- 它有工具（self.tools）
+- 它有记忆压缩（_compact_context）
+- 它有安全边界（通过 Session/Guardian）
+- 它不知道自己是不是子 Agent（位置透明性）
+
+## 循环结构
+
+    while iteration < max_iterations:
+        1. 检查超时、取消、IPC 事件
+        2. 检查是否需要记忆压缩（should_auto_compact）
+        3. 调用 LLM（流式或非流式）
+        4. 如果没有 tool_calls → 完成，返回结果
+        5. 如果有 tool_calls → 并行执行（asyncio.gather）
+        6. 保存 turn 到 turns.jsonl
+
+## 关键加固措施
+
+参考 Butterfly + EVA + Kimi Code + Codex 的设计：
+
+- **max_iterations**：防止无限循环（默认 50）
+- **timeout**：节点级超时（默认 600s）
+- **Turn 持久化**：每轮后 save_turn，取消时 save_partial_turn
+- **IPC 事件轮询**：每轮前检查 events.jsonl，支持外部中断/消息
+- **孤儿 tool_call 封印**：取消时补全 synthetic tool_result，防止下次运行 LLM 返回 400
+- **Fallback 模型**：主模型失败时自动切换备用模型（网络/服务端错误）
+- **流式输出**：SSE 逐 token 实时打印，tool_call delta 按索引拼装
+- **记忆压缩**：LLM 驱动压缩 + 验证 + 截断回退 + 专用压缩模型
+- **人工审批**：工具调用审批门，基于 events.jsonl IPC 轮询
+
+## 流式输出实现
+
+OpenAI/DeepSeek 流式 API 按 chunk 发送数据：
+- content delta → 累积到 content_parts 并实时打印
+- tool_call delta → 按 index 累积（id、name、arguments 分片到达）
+- 最后一个 chunk 包含 usage 信息
+
+关键细节：tool_call 的 arguments 是分片的 JSON 字符串，需要字符串拼接而非 JSON 合并。
 """
+
 
 import asyncio
 import json
@@ -574,6 +609,17 @@ class AgentLoop:
         target = int(self.token_cap * 0.7)
         truncated = SimpleCompaction.truncate_messages(self.messages, max_tokens=target)
         self.messages = truncated
+        self.session.clear_turns()
+        self.session.write_system_turn(system_prompt)
+        self.session.save_turn(
+            {
+                "type": "turn",
+                "messages": list(self.messages),
+                "compact": True,
+                "fallback": "truncation",
+                "ts": datetime.now().isoformat(),
+            }
+        )
         post_token_count = estimate_text_tokens(self.messages)
         print(f"  [截断完成] {pre_token_count} → {post_token_count} tokens, 保留 {len(self.messages)} 条消息")
         if self.hooks:
