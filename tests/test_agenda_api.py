@@ -146,9 +146,7 @@ class TestValidateAndCorrectOutput:
         )
         agent.messages = [{"role": "system", "content": ""}]
 
-        node_config = {
-            "output_schema": {"type": "object", "properties": {"fixed": {"type": "boolean"}}}
-        }
+        node_config = {"output_schema": {"type": "object", "properties": {"fixed": {"type": "boolean"}}}}
 
         result = asyncio.run(
             _validate_and_correct_output(
@@ -189,9 +187,7 @@ class TestValidateAndCorrectOutput:
         session = Session(tmp_path / "nodes" / "test")
         # No output/draft.md written
 
-        node_config = {
-            "output_schema": {"type": "object", "properties": {"x": {"type": "string"}}}
-        }
+        node_config = {"output_schema": {"type": "object", "properties": {"x": {"type": "string"}}}}
 
         result = asyncio.run(
             _validate_and_correct_output(
