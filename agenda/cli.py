@@ -599,9 +599,109 @@ def _dag_status(scheduler: DAGScheduler, dag_path: Path) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
-# Init template
-# ---------------------------------------------------------------------------
+def _viz_dag(scheduler: DAGScheduler, mermaid: bool = False) -> str:
+    """生成 DAG 可视化：ASCII 拓扑图（默认）或 Mermaid 流程图。
+
+    ASCII 模式直接输出到终端。Mermaid 模式生成可渲染的流程图代码。
+    """
+    nodes = scheduler.dag.get("nodes", {})
+    dag_meta = scheduler.dag.get("dag", {})
+    name = dag_meta.get("name", "untitled")
+    max_parallel = dag_meta.get("max_parallel", 4)
+    node_ids = list(nodes.keys())
+
+    if not node_ids:
+        return "(empty DAG)"
+
+    if mermaid:
+        return _viz_mermaid(name, max_parallel, nodes, node_ids)
+    return _viz_ascii(name, max_parallel, nodes, node_ids)
+
+
+def _viz_ascii(name: str, max_parallel: int, nodes: dict, node_ids: list[str]) -> str:
+    """ASCII 终端可视化。"""
+    lines = [f"DAG: {name}  ({len(node_ids)} nodes, max_parallel={max_parallel})", "=" * 50]
+
+    # ── 拓扑分层 ──────────────────────────────────
+    # 计算每个节点的层级（最长依赖链长度）
+    levels: dict[str, int] = {}
+
+    def get_level(nid: str, visited: set | None = None) -> int:
+        if visited is None:
+            visited = set()
+        if nid in visited:
+            return levels.get(nid, 0)
+        if nid in levels:
+            return levels[nid]
+        visited.add(nid)
+        deps = nodes.get(nid, {}).get("deps", [])
+        lvl = 0 if not deps else 1 + max(get_level(d, visited.copy()) for d in deps)
+        levels[nid] = lvl
+        return lvl
+
+    for nid in node_ids:
+        get_level(nid)
+
+    # 按层级分组
+    by_level: dict[int, list[str]] = {}
+    for nid, lvl in levels.items():
+        by_level.setdefault(lvl, []).append(nid)
+
+    max_level = max(levels.values()) if levels else 0
+
+    # ── 渲染层级 ──────────────────────────────────
+    for lvl in range(max_level + 1):
+        batch = by_level.get(lvl, [])
+        if lvl == 0:
+            lines.append(f"\n  Level {lvl} (starting nodes):")
+        elif lvl == max_level:
+            lines.append(f"\n  Level {lvl} (final nodes):")
+        else:
+            lines.append(f"\n  Level {lvl}:")
+
+        for nid in batch:
+            cfg = nodes[nid]
+            model = cfg.get("model", "default")
+            deps = cfg.get("deps", [])
+            deps_str = f"  ← depends on: [{', '.join(deps)}]" if deps else "  (no dependencies)"
+            marker = ""
+
+            # 并行标记：同层无依赖节点标注
+            if lvl == 0 and len(batch) > 1:
+                marker = " ⚡parallel"
+            elif lvl > 0:
+                sibling_deps = [d for n in batch for d in nodes[n].get("deps", [])]
+                if len(batch) > 1 and len(set(sibling_deps)) == len(sibling_deps):
+                    marker = " ⚡parallel"
+
+            lines.append(f"    ◉ {nid} [{model}]{marker}{deps_str}")
+
+    # ── 汇总 ──────────────────────────────────
+    lines.append(f"\n{'=' * 50}")
+    lines.append(f"Total: {len(node_ids)} nodes, {max_level} level(s)")
+    lines.append("Legend: ⚡parallel = can run concurrently")
+
+    return "\n".join(lines)
+
+
+def _viz_mermaid(name: str, max_parallel: int, nodes: dict, node_ids: list[str]) -> str:
+    """Mermaid 流程图代码。"""
+    lines = ["```mermaid", "flowchart LR"]
+
+    # 节点样式
+    for nid in node_ids:
+        cfg = nodes[nid]
+        model = cfg.get("model", "default")
+        label = f"{nid}<br/>({model})"
+        lines.append(f'    {nid}["{label}"]')
+
+    # 边
+    for nid in node_ids:
+        for dep in nodes[nid].get("deps", []):
+            lines.append(f"    {dep} --> {nid}")
+
+    lines.append("```")
+    return "\n".join(lines)
 
 DEFAULT_DAG_YAML = """\
 dag:
@@ -711,6 +811,10 @@ def cli() -> int:
     dag_status = dag_sub.add_parser("status", help="DAG 状态")
     dag_status.add_argument("path", nargs="?")
     dag_status.add_argument("--watch", action="store_true")
+
+    dag_viz = dag_sub.add_parser("viz", help="可视化 DAG 拓扑")
+    dag_viz.add_argument("path", nargs="?")
+    dag_viz.add_argument("--mermaid", action="store_true", help="输出 Mermaid 流程图代码")
 
     # ------------------------------------------------------------------
     # node
@@ -1033,6 +1137,18 @@ def cli() -> int:
                         return 130
 
                 _json_out(_dag_status(scheduler, dag_path))
+                return EXIT_SUCCESS
+            except FileNotFoundError as e:
+                return _error_out(str(e), EXIT_ARGS_ERROR)
+            except Exception as e:
+                return _error_out(str(e), EXIT_EXECUTION_ERROR, traceback=traceback.format_exc())
+
+        if args.dag_cmd == "viz":
+            try:
+                dag_path = _resolve_dag_path(args.path)
+                scheduler = _load_scheduler(dag_path)
+                output = _viz_dag(scheduler, mermaid=args.mermaid)
+                print(output)
                 return EXIT_SUCCESS
             except FileNotFoundError as e:
                 return _error_out(str(e), EXIT_ARGS_ERROR)

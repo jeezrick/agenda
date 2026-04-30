@@ -1,0 +1,143 @@
+dag:
+  name: "AI Agent框架调研对比"
+  max_parallel: 3
+
+nodes:
+  research_langgraph:
+    prompt: |
+      你的任务是调研 LangGraph 框架。
+
+      请用 write_file 工具将以下内容写入 output/draft.md：
+
+      ## LangGraph 调研
+
+      ### 核心特点
+      1. （列出 3 个核心特点）
+      2.
+      3.
+
+      ### 优势
+      - （列出 2-3 个优势）
+
+      ### 劣势
+      - （列出 2-3 个劣势）
+
+      ### 适合场景
+      （描述最适合的使用场景）
+
+      ### 不适合场景
+      （描述不推荐使用的场景）
+
+      要求：每个点用一句话描述，简洁准确。不需要长篇大论。
+    model: "deepseek-flash"
+    max_iterations: 5
+    timeout: 120
+
+  research_crewai:
+    prompt: |
+      你的任务是调研 CrewAI 框架。
+
+      请用 write_file 工具将以下内容写入 output/draft.md：
+
+      ## CrewAI 调研
+
+      ### 核心特点
+      1. （列出 3 个核心特点）
+      2.
+      3.
+
+      ### 优势
+      - （列出 2-3 个优势）
+
+      ### 劣势
+      - （列出 2-3 个劣势）
+
+      ### 适合场景
+      （描述最适合的使用场景）
+
+      ### 不适合场景
+      （描述不推荐使用的场景）
+
+      要求：每个点用一句话描述，简洁准确。不需要长篇大论。
+    model: "deepseek-flash"
+    max_iterations: 5
+    timeout: 120
+
+  research_autogen:
+    prompt: |
+      你的任务是调研 AutoGen 框架。
+
+      请用 write_file 工具将以下内容写入 output/draft.md：
+
+      ## AutoGen 调研
+
+      ### 核心特点
+      1. （列出 3 个核心特点）
+      2.
+      3.
+
+      ### 优势
+      - （列出 2-3 个优势）
+
+      ### 劣势
+      - （列出 2-3 个劣势）
+
+      ### 适合场景
+      （描述最适合的使用场景）
+
+      ### 不适合场景
+      （描述不推荐使用的场景）
+
+      要求：每个点用一句话描述，简洁准确。不需要长篇大论。
+    model: "deepseek-flash"
+    max_iterations: 5
+    timeout: 120
+
+  summary:
+    prompt: |
+      你的任务是综合三份调研报告，写一份框架选型对比总结。
+
+      请先用 read_file 读取三份上游调研结果：
+      - input/langgraph.md
+      - input/crewai.md
+      - input/autogen.md
+
+      然后用 write_file 将以下内容写入 output/draft.md：
+
+      # AI Agent 框架选型对比报告
+
+      ## 一、框架概览
+      一句话总结每个框架的定位。
+
+      ## 二、综合对比表
+
+      | 维度 | LangGraph | CrewAI | AutoGen |
+      |------|-----------|--------|---------|
+      | 核心特点 | | | |
+      | 优势 | | | |
+      | 劣势 | | | |
+      | 适合场景 | | | |
+      | 不适合场景 | | | |
+
+      ## 三、选型建议
+
+      根据以下场景分别推荐：
+      - 场景 1：需要精确控制流程的企业级应用
+      - 场景 2：快速原型验证的小团队
+      - 场景 3：需要复杂多 Agent 对话的研究项目
+
+      ## 四、总结
+      给出最终推荐和理由（不超过 200 字）。
+
+      要求：数据来自三份上游报告，不要编造。对比表要完整。
+    model: "deepseek-pro"
+    deps: [research_langgraph, research_crewai, research_autogen]
+    dep_inputs:
+      - from: "nodes/research_langgraph/output/draft.md"
+        to: "langgraph.md"
+      - from: "nodes/research_crewai/output/draft.md"
+        to: "crewai.md"
+      - from: "nodes/research_autogen/output/draft.md"
+        to: "autogen.md"
+    max_iterations: 10
+    timeout: 180
