@@ -643,8 +643,12 @@ def _viz_ascii(name: str, max_parallel: int, nodes: dict, node_ids: list[str]) -
     lines: list[str] = []
 
     # ── Header ─────────────────────────────────────
-    lines.append(f"  {B}╭─ {name} ─{D} {len(node_ids)} nodes · {max_parallel} parallel · {max_level + 1} level(s) {R}{B}─╮{R}")
-    lines.append(f"  {B}╰{'─' * (len(name) + len(str(len(node_ids))) + len(str(max_parallel)) + len(str(max_level + 1)) + 27)}╯{R}")
+    lines.append(
+        f"  {B}╭─ {name} ─{D} {len(node_ids)} nodes · {max_parallel} parallel · {max_level + 1} level(s) {R}{B}─╮{R}"
+    )
+    lines.append(
+        f"  {B}╰{'─' * (len(name) + len(str(len(node_ids))) + len(str(max_parallel)) + len(str(max_level + 1)) + 27)}╯{R}"
+    )
     lines.append("")
 
     # ── Nodes by level ─────────────────────────────
@@ -743,6 +747,7 @@ def _viz_mermaid(name: str, max_parallel: int, nodes: dict, node_ids: list[str])
 
     lines.append("```")
     return "\n".join(lines)
+
 
 DEFAULT_DAG_YAML = """\
 dag:
