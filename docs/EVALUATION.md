@@ -12,6 +12,8 @@ agenda 的独特组合：
 | Agent-facing | AutoGen, CrewAI | ✅ |
 | **四者结合** | **❌ 没有** | **✅ 首次** |
 
+> **注**：oh-my-pi（pi-mono fork）同样具备 DAG-like 的 Task 编排、Subagent 递归、Workspace 隔离，但它是**人机交互终端**（TUI + 流式输出），不是 Agent-facing 运行时。两者在定位上互补。详见 [research-oh-my-pi.md](./research-oh-my-pi.md)。
+
 ## 2. 与现有工作的对比
 
 ### 2.1 学术界
@@ -33,6 +35,7 @@ agenda 的独特组合：
 
 ### 2.2 工业界
 
+- **oh-my-pi**: 功能最全面的终端 Agent（TUI + 40+ provider + LSP + Browser + Python REPL + Task Subagent），但它是**人机交互界面**，不是 Agent-facing 运行时。其 Subagent 是对话式（spawn → stream → poll），Agenda 是 DAG 节点式（调度 → 执行 → 状态机）。详见 [research-oh-my-pi.md](./research-oh-my-pi.md)。
 - **Kimi Code CLI**: 有 subagent（前台/后台），无 DAG
 - **Claude Code**: 无内置 DAG/subagent
 - **OpenAI Swarm**: 轻量级多 Agent，无 DAG
