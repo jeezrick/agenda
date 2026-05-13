@@ -369,6 +369,7 @@ class AgentLoop:
         kwargs["stream_options"] = {"include_usage": True}
 
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
         tool_call_deltas: dict[int, dict[str, Any]] = {}  # index -> accumulated
         usage: dict | None = None
 
@@ -385,6 +386,8 @@ class AgentLoop:
             if delta.content:
                 content_parts.append(delta.content)
                 print(f"{prefix}{delta.content}", end="", flush=True)
+            if hasattr(delta, "reasoning_content") and delta.reasoning_content:
+                reasoning_parts.append(delta.reasoning_content)
 
             if delta.tool_calls:
                 for tc_delta in delta.tool_calls:
@@ -408,9 +411,12 @@ class AgentLoop:
             print()  # 换行结束流式输出
 
         content = "".join(content_parts)
+        reasoning_content = "".join(reasoning_parts) if reasoning_parts else None
         tool_calls = [tool_call_deltas[i] for i in sorted(tool_call_deltas)] if tool_call_deltas else None
 
         message: dict[str, Any] = {"role": "assistant", "content": content}
+        if reasoning_content:
+            message["reasoning_content"] = reasoning_content
         if tool_calls:
             message["tool_calls"] = tool_calls
 
